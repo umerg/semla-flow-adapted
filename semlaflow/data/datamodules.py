@@ -40,7 +40,11 @@ class SmolDM(L.LightningDataModule):
             if test_dataset is not None and max(test_dataset.lengths) > largest_padding:
                 raise ValueError("At least one item in test dataset is larger than largest padded size.")
 
-        self._num_workers = len(os.sched_getaffinity(0))
+        self._num_workers = (
+            len(os.sched_getaffinity(0))
+            if hasattr(os, "sched_getaffinity")
+            else os.cpu_count() or 1
+        )
 
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset

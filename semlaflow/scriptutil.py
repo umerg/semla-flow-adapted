@@ -24,6 +24,14 @@ GEOM_COORDS_STD_DEV = 2.407038688659668
 QM9_BUCKET_LIMITS = [12, 16, 18, 20, 22, 24, 30]
 GEOM_DRUGS_BUCKET_LIMITS = [24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 72, 96, 192]
 
+# Neurons: measured over /Users/umer/Documents/neurons_final/train by
+# semlaflow.preprocess_neurons (post per-tree zero-CoM). Re-run that script to
+# refresh this value if the training corpus changes.
+# Bucket limits cover the observed size distribution (p5=18, median=46,
+# p95=108, max=258). Train max observed: 217.
+NEURON_COORDS_STD_DEV = 62.6894
+NEURON_BUCKET_LIMITS = [24, 40, 56, 72, 96, 128, 160, 200, 220]
+
 PROJECT_PREFIX = "equinv"
 BOND_MASK_INDEX = 5
 COMPILER_CACHE_SIZE = 128
@@ -113,6 +121,26 @@ def build_vocab():
     other_atoms = ["Br", "B", "Al", "Si", "As", "I", "Hg", "Bi"]
     tokens = special_tokens + core_atoms + other_atoms
     return Vocabulary(tokens)
+
+
+def build_neuron_vocab():
+    # Single real node type; PAD at 0, MASK at 1, NODE at 2.
+    # swc.NEURON_NODE_TOKEN_INDEX depends on this ordering.
+    return Vocabulary(["<PAD>", "<MASK>", "NODE"])
+
+
+# Transform for neuron GeometricMol objects. Skips the molecular atomic-number
+# -> element-symbol -> vocab-index path and the charge remapping: the adapter
+# already stores atomics as vocab indices and charges as zeros.
+def neuron_mol_transform(molecule, vocab, n_bonds, coord_std):
+    rotation = tuple(np.random.rand(3) * np.pi * 2)
+    molecule = molecule.scale(1.0 / coord_std).rotate(rotation).zero_com()
+
+    atomics_one_hot = smolF.one_hot_encode_tensor(molecule.atomics, vocab.size)
+    bond_types_one_hot = smolF.one_hot_encode_tensor(molecule.bond_types, n_bonds)
+
+    transformed = molecule._copy_with(atomics=atomics_one_hot, bond_types=bond_types_one_hot)
+    return transformed
 
 
 # TODO support multi gpus

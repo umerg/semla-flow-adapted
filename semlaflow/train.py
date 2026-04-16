@@ -12,6 +12,7 @@ from semlaflow.data.datamodules import GeometricInterpolantDM
 from semlaflow.data.datasets import GeometricDataset
 from semlaflow.data.interpolate import GeometricInterpolant, GeometricNoiseSampler
 from semlaflow.models.fm import Integrator, MolecularCFM
+from semlaflow.models.neuron_cfm import NeuronCFM
 from semlaflow.models.semla import EquiInvDynamics, SemlaGenerator
 
 DEFAULT_DATASET = "geom-drugs"
@@ -120,6 +121,8 @@ def build_model(args, dm, vocab):
         coord_scale = util.QM9_COORDS_STD_DEV
     elif args.dataset == "geom-drugs":
         coord_scale = util.GEOM_COORDS_STD_DEV
+    elif args.dataset == "neurons":
+        coord_scale = util.NEURON_COORDS_STD_DEV
     else:
         raise ValueError(f"Unknown dataset {args.dataset}")
 
@@ -147,7 +150,11 @@ def build_model(args, dm, vocab):
         )
 
     train_steps = util.calc_train_steps(dm, args.epochs, args.acc_batches)
-    train_smiles = None if args.trial_run else [mols.str_id for mols in dm.train_dataset]
+    # Neurons have no SMILES — skip the RDKit novelty path entirely.
+    if args.trial_run or args.dataset == "neurons":
+        train_smiles = None
+    else:
+        train_smiles = [mols.str_id for mols in dm.train_dataset]
 
     print(f"Total training steps {train_steps}")
 
@@ -160,7 +167,8 @@ def build_model(args, dm, vocab):
         bond_mask_index=bond_mask_index,
     )
 
-    fm_model = MolecularCFM(
+    cfm_cls = NeuronCFM if args.dataset == "neurons" else MolecularCFM
+    fm_model = cfm_cls(
         egnn_gen,
         vocab,
         args.lr,
@@ -196,13 +204,24 @@ def build_dm(args, vocab):
         coord_std = util.GEOM_COORDS_STD_DEV
         padded_sizes = util.GEOM_DRUGS_BUCKET_LIMITS
 
+    elif args.dataset == "neurons":
+        coord_std = util.NEURON_COORDS_STD_DEV
+        padded_sizes = util.NEURON_BUCKET_LIMITS
+
     else:
-        raise ValueError(f"Unknown dataset {args.dataset}. Available datasets are `qm9` and `geom-drugs`.")
+        raise ValueError(
+            f"Unknown dataset {args.dataset}. Available: `qm9`, `geom-drugs`, `neurons`."
+        )
 
     data_path = Path(args.data_path)
 
     n_bond_types = util.get_n_bond_types(args.categorical_strategy)
-    transform = partial(util.mol_transform, vocab=vocab, n_bonds=n_bond_types, coord_std=coord_std)
+    if args.dataset == "neurons":
+        transform = partial(
+            util.neuron_mol_transform, vocab=vocab, n_bonds=n_bond_types, coord_std=coord_std
+        )
+    else:
+        transform = partial(util.mol_transform, vocab=vocab, n_bonds=n_bond_types, coord_std=coord_std)
 
     # Load generated dataset with different transform fn if we are distilling a model
     # if args.distill:
@@ -317,7 +336,15 @@ def build_trainer(args):
 
     logger = WandbLogger(project=project_name, save_dir="wandb", log_model=True)
     lr_monitor = LearningRateMonitor(logging_interval="step")
-    checkpointing = ModelCheckpoint(every_n_epochs=val_check_epochs, monitor="val-validity", mode="max", save_last=True)
+    if args.dataset == "neurons":
+        # Neurons don't have RDKit validity; use the loss instead.
+        checkpointing = ModelCheckpoint(
+            every_n_epochs=val_check_epochs, monitor="val-loss", mode="min", save_last=True
+        )
+    else:
+        checkpointing = ModelCheckpoint(
+            every_n_epochs=val_check_epochs, monitor="val-validity", mode="max", save_last=True
+        )
 
     # No logger if doing a trial run
     logger = None if args.trial_run else logger
@@ -349,8 +376,8 @@ def main(args):
     util.configure_fs()
 
     print("Building model vocab...")
-    vocab = util.build_vocab()
-    print("Vocab complete.")
+    vocab = util.build_neuron_vocab() if args.dataset == "neurons" else util.build_vocab()
+    print(f"Vocab complete. Size={vocab.size}")
 
     print("Loading datamodule...")
     dm = build_dm(args, vocab)

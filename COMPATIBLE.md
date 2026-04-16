@@ -1,0 +1,732 @@
+# SemlaFlow → Neuron/Tree Adaptation: Compatibility Notes
+
+This document explains exactly how SemlaFlow (an E(3)-equivariant flow-matching
+model for 3D molecules) was adapted to generate neuron/botanical-tree morphologies
+from SWC data. It covers every assumption, every mapping between molecular and
+tree concepts, and the argument for why the model architecture is still valid
+for this domain.
+
+Audience: you (the owner of `dendrite_gen`) and anyone reviewing the baseline
+before publishing. The goal is to make it possible to challenge every design
+decision individually.
+
+---
+
+## 1. Problem Statement Recap
+
+**Source domain (SemlaFlow original):** 3D molecular graphs with N atoms. Joint
+flow-matching over:
+- **Coordinates** `x ∈ R^{N×3}` (continuous, Gaussian prior → data)
+- **Atom types** `a ∈ {1..V}^N` (discrete, categorical via DFM)
+- **Bond types** `b ∈ {0..B}^{N×N}` (discrete, dense adjacency via DFM)
+- **Formal charges** `c ∈ {-3..+3}^N` (discrete, categorical via DFM)
+
+**Target domain (your use case):** 3D tree graphs representing neurons. Each
+node has a 3D position. Edges are binary (edge / no-edge). No per-node
+categorical information (all nodes are type=3 dendrite, all radii=1.0). Trees
+are rooted, acyclic, and binary-branching below the root; root degree varies
+(observed range 1–26, median 7).
+
+**Goal:** run SemlaFlow unmodified at the architecture level, with the minimal
+adapters needed to feed it the right tensor shapes. Trust the model to learn
+"topology as a one-shot classification over all pairs" and "geometry as a
+flow-matched point cloud." Its failure modes (cycles, disconnections, high-
+degree violations, no tree invariant) are the point — they are the baseline
+SemlaFlow-can't-do-X motivation for your K-Root-Children approach.
+
+---
+
+## 2. One-Line Summary of the Adaptation
+
+> Build `GeometricMol` objects directly (bypassing RDKit) with a trivial
+> 1-type vocabulary and a trivial 1-class edge set. Wire a new
+> `--dataset neurons` branch through `train.py` that (a) swaps in a neuron
+> vocab, (b) skips the atomic-number ↔ element-symbol remapping, (c) replaces
+> the RDKit-driven validation metrics with loss-only validation, and
+> (d) monitors `val-loss` instead of `val-validity` for checkpointing.
+> **No architecture changes. No loss-function changes. No flow-matching
+> changes.**
+
+---
+
+## 3. Concept-by-Concept Mapping
+
+| Molecular concept           | Neuron concept                       | How it's wired                                                                                 |
+|-----------------------------|--------------------------------------|------------------------------------------------------------------------------------------------|
+| Atom coordinate             | Soma/dendrite node position          | `GeometricMol.coords[N, 3]` holds the SWC x,y,z directly.                                     |
+| Atom type (e.g. C, N, O)    | (Nothing — single node type)         | `atomics[N]` filled with a constant index pointing at the single real token `"NODE"`.         |
+| Bond type (single/double/…) | Edge exists                          | `bond_types[M]` filled with index 1 (reusing the "single bond" slot; see §6 for why).         |
+| "No bond" between two atoms | No edge                              | Implicit in the dense adjacency: pairs not listed in `bond_indices` default to class 0.       |
+| Formal charge               | (Nothing)                            | `charges[N]` filled with 0. The charge head exists but its loss weight is 0.                  |
+| Atomic-number → vocab map   | Vocab index already stored           | `neuron_mol_transform` skips the `PT.symbol_from_atomic(...)` step of `mol_transform`.        |
+| `CHARGE_IDX_MAP` remap      | (Not needed — all charges are 0)     | `neuron_mol_transform` skips the `CHARGE_IDX_MAP[charge]` lookup.                             |
+| QM9/GEOM coord std (1.72 / 2.41) | 62.6894 (measured on your train set) | Stored in `scriptutil.NEURON_COORDS_STD_DEV`. Re-run `preprocess_neurons.py` if data changes. |
+| QM9/GEOM bucket limits      | `[24, 40, 56, 72, 96, 128, 160, 200, 220]` | Chosen to cover your size distribution (p5=18, p95=108, observed train max=217).              |
+| Validity / novelty / energy metrics | (Not applicable)             | `NeuronCFM` empties `gen_metrics` and `stability_metrics`; overrides `validation_step`.       |
+| RDKit-based `predict.py`    | (Broken as-is; out of scope)         | Flagged in §9 as required future work for sampling.                                           |
+
+---
+
+## 4. Assumptions (Explicit List)
+
+Every assumption below is one you can override with a small code change; I've
+noted where.
+
+### 4.1 Single node type
+**Assumption:** all nodes are functionally identical.
+**Why:** your SWC corpus has `type=3` uniformly and `radius=1.0` uniformly.
+No categorical signal exists per-node.
+**Where encoded:** `semlaflow/data/swc.py:NEURON_NODE_TOKEN_INDEX=2` and
+`scriptutil.build_neuron_vocab()` returning `["<PAD>", "<MASK>", "NODE"]`.
+**Override path:** add tokens to `build_neuron_vocab()` and change the adapter
+to assign per-node indices (e.g. "ROOT" vs "BRANCH" vs "LEAF") if that signal
+becomes useful.
+
+### 4.2 Binary edges
+**Assumption:** every edge in a training neuron is the same "single edge"
+class; the generation task is edge-exists vs edge-absent.
+**Why:** your SWC has no edge attributes; the data is pure tree connectivity.
+**Where encoded:** `swc.py:NEURON_EDGE_CLASS_INDEX=1`.
+**Override path:** if you later want multi-class edges (e.g. axon/dendrite),
+extend the adapter and possibly increase `n_bond_types` (see §6 for the
+subtlety here).
+
+### 4.3 Use the `mask` categorical strategy (recommended, not enforced)
+**Assumption:** my training command suggests `--categorical_strategy mask`.
+**Why:** it cleanly handles the "most pairs have no edge" class imbalance —
+during training, most of the target adjacency is the background (absent)
+class, and mask DFM only computes loss on *currently-masked* positions, so the
+gradient signal is concentrated where the model is uncertain.
+**Consequences:** `get_n_bond_types("mask") = 6` (4 molecular bond classes +
+background + mask). For `uniform-sample` / `dirichlet` strategies,
+`n_bond_types = 5` and you should verify my `BOND_MASK_INDEX=5` constant isn't
+read (it is only referenced when strategy is `mask`).
+**Override path:** CLI flag — nothing in the adapter forces `mask`.
+
+### 4.4 Zero center-of-mass before training
+**Assumption:** every tree is translated so that its CoM (arithmetic mean of
+node coords) is at the origin, then rotated by a random 3D rotation, then
+scaled by `1/coord_std`.
+**Why:** this is the existing SemlaFlow `mol_transform` pipeline and it's what
+makes E(3)-equivariance empirically stable (targets always live near origin
+with unit std).
+**Consequence:** the root is *not* at origin (unlike `dendrite_gen`'s
+convention, which root-centers). This doesn't matter for SemlaFlow because
+E(3)-equivariance means the model can generate rotated/translated versions of
+the same graph equally well — it will internally learn to place the
+root wherever the data says.
+**Override path:** subtract root instead of CoM inside `neuron_mol_transform`
+(one-liner), but there's no reason to: zero-CoM is model-friendly and you're
+not conditioning on root position anyway.
+
+### 4.5 Coordinate scaling factor = 62.6894
+**Assumption:** `NEURON_COORDS_STD_DEV = 62.6894`, measured as
+`np.concatenate([coords - coords.mean(0, keepdims=True) for coords in train]).std()`.
+**Why:** matches what `mol_transform` does for molecules — scales coords so
+post-transform std is roughly 1. Prior sampler is standard-Gaussian, so we
+need data to be in the same scale.
+**Consequence:** generated samples must be multiplied by 62.6894 before
+saving/rendering, and compared against data at the same scale. The
+`coord_scale` attribute of `MolecularCFM` tracks this automatically.
+**Override path:** re-run `semlaflow/preprocess_neurons.py` whenever the
+training corpus changes and paste the new number into `scriptutil.py`.
+
+### 4.6 Bucket limits `[24, 40, 56, 72, 96, 128, 160, 200, 220]`
+**Assumption:** this 9-bucket schedule covers the neuron size distribution.
+**Why:** p5=18, median=46, p75=65, p95=108, train-max=217. Drug buckets end
+at 192 and would silently drop your largest graphs. The chosen buckets put
+roughly balanced counts in each (1858/5054/4679/2338/1631/894/165/17/3
+observed during preprocess).
+**Override path:** edit `NEURON_BUCKET_LIMITS` in `scriptutil.py`. If you
+shard/downsample the dataset, re-check the distribution.
+
+### 4.7 Drop graphs with N > 256
+**Assumption:** the hard cap is 256 (SemlaFlow's `DEFAULT_MAX_ATOMS`).
+**Consequence:** 1 validation graph was silently dropped during preprocess
+(the one with N=258). 0 training graphs dropped (train max was 217).
+**Override path:** raise `--max_atoms` at training time if you also want those
+rare large val graphs scored. For generation-only you don't need this.
+
+### 4.8 Charges: keep the head, zero the loss
+**Assumption:** the charge classifier head (fixed at 7 classes) stays in the
+model; `charges = torch.zeros(N, dtype=long)` in every adapter output; the
+training command sets `--charge_loss_weight 0.0`.
+**Why:** the head is hardcoded at 7 in `SemlaGenerator` (`semla.py:773`,
+`n_charges=7`). Refactoring the head size would require touching the model
+code; zeroing the loss weight is a one-flag change and avoids the risk of
+introducing a bug in the architecture. The head still runs each forward pass
+(wasted compute: a tiny MLP per node), but the loss it produces is multiplied
+by 0 and contributes no gradient.
+**Override path:** if compute matters, guard the head creation in
+`semla.py:SemlaGenerator.__init__` behind an `if self.n_charges > 0` and pass
+`n_charges=0` for neurons. Optional cleanup; not required for correctness.
+
+### 4.9 Validation skips generation-quality metrics
+**Assumption:** during validation, we compute the same four losses used at
+training (coord MSE + type CE + bond CE + charge CE) and log them; we do NOT
+call `_generate_mols` / `_generate_stabilities` to decode RDKit molecules.
+**Why:** those two methods try to build chemically valid molecules from the
+predicted (coords, atom_types, bonds, charges) tuple via RDKit; they would
+error on a 1-token vocab and binary edges. Also: the generative-quality
+metrics they feed (`Validity`, `Uniqueness`, `Novelty`, `EnergyValidity`,
+`MoleculeStability`, etc.) are chemistry-specific and have no analogue in
+neuron evaluation.
+**Consequence:** you don't get generation metrics during training. You WILL
+need a separate evaluation pipeline (see §9) to sample and compute
+tree-specific metrics (degree distribution, cycle presence, tree-depth,
+end-to-end MMD against training data, etc.).
+**Override path:** implement neuron metrics inside
+`NeuronCFM.on_validation_epoch_end` if you want live metrics. Straightforward
+but not done here.
+
+### 4.10 Checkpoint monitors `val-loss` instead of `val-validity`
+**Assumption:** `ModelCheckpoint(monitor="val-loss", mode="min")` when
+`--dataset neurons`.
+**Why:** `val-validity` is an RDKit-validity rate and doesn't exist in
+`NeuronCFM`. The sum of the 4 per-step losses is a reasonable "is the model
+fitting?" signal.
+**Consequence:** the "best" checkpoint is the lowest-loss one, which is
+usually the longest-trained EMA model. Fine for a baseline. If you want to
+select based on a more task-relevant metric, add one in
+`on_validation_epoch_end` and change the monitor.
+
+---
+
+## 5. What Survived Unchanged (and Why That's Safe)
+
+The parts of SemlaFlow that were **not** modified, with the argument that they
+remain correct for neuron data:
+
+### 5.1 `SemlaGenerator` / `EquiInvDynamics` (`models/semla.py`)
+These are the actual neural networks. They take:
+- `coords [B, N, 3]` — 3D point cloud (data-agnostic)
+- `features [B, N, d]` — invariant per-node features (time + atomics one-hot)
+- `edge_feats [B, N, N, d_edge]` — pairwise edge features (bond one-hot)
+- `atom_mask [B, N]` — which nodes are real vs padding
+
+None of these have molecular semantics. The network assumes E(3) equivariance
+over coords (translations and rotations of the input cause the same
+transformation on the output) and permutation equivariance over nodes. Both
+assumptions hold for trees as much as for molecules.
+
+**Why I'm sure:** I traced the input shape through `build_model` → `SemlaGenerator` → `EquiInvDynamics` and verified the model only consumes
+the four fields above, never references atomic-number-specific logic or
+valency constraints. Searched `semla.py` for chemistry-specific identifiers
+(valency, aromatic, atomic_number) and found none.
+
+### 5.2 Flow-matching interpolant & prior sampler (`data/interpolate.py`)
+The interpolant builds the noisy `interpolated` sample at time `t ∈ [0, 1]`
+by mixing data with prior:
+- Coords: linear interpolation with Gaussian noise (data-agnostic).
+- Atomics: categorical DFM. The number of categories is our `vocab.size=3`.
+- Bonds: categorical DFM over `n_bond_types=6`.
+- Charges: categorical DFM over 7 classes (unused via loss weight).
+
+**Why I'm sure:** the interpolant receives `vocab.size` and `n_bond_types` as
+arguments in `GeometricInterpolantDM`. I verified that `build_dm` passes our
+neuron values through (`vocab.size=3`, `n_bond_types=6`). The interpolant
+itself doesn't care what the categories mean.
+
+### 5.3 Losses (`models/fm.py:_loss`)
+- Coord loss: MSE on masked positions (data-agnostic).
+- Type loss: CE over vocab.size classes (data-agnostic).
+- Bond loss: CE over n_bond_types classes on a mask-weighted dense adjacency
+  (data-agnostic).
+- Charge loss: CE over 7 classes (unused; weighted 0).
+
+All four losses are tensor operations with no domain semantics. Multiplying
+`type_loss_weight=0` zeroes the gradient contribution cleanly.
+
+### 5.4 Optimal transport (`--optimal_transport equivariant`)
+OT aligns prior samples to data samples via Hungarian matching with
+equivariant distance — this is just an energy minimization over a cost matrix
+of pairwise L2 distances on coords. Data-agnostic.
+
+### 5.5 EMA + self-conditioning
+Both are meta-training tricks that operate on the model's parameters and
+outputs respectively. Neither references the data domain.
+
+### 5.6 `GeometricDataset` and `GeometricMolBatch`
+Pure-container classes. They pad coords, atomics, bonds, charges, and masks
+into batched tensors. They do not interpret any of the contents chemically.
+
+---
+
+## 6. The One Subtle Compatibility Decision: `n_bond_types = 6`
+
+This deserves its own section because it's the one place where the adaptation
+is "not quite clean" and could bite someone editing the code later.
+
+### What happened
+`scriptutil.get_n_bond_types("mask")` returns
+`len(BOND_IDX_MAP) + 1 + 1 = 4 + 1 + 1 = 6`. The class labels are:
+- 0: no-bond (background, implicit)
+- 1: single bond
+- 2: double bond
+- 3: triple bond
+- 4: aromatic bond
+- 5: `<BOND_MASK>` (absorbing token for the mask DFM strategy)
+
+For neurons, we only use class 0 ("no edge") and class 1 ("edge"), leaving
+classes 2, 3, 4 unused during training. The model's edge classifier head
+has 6 logits; three of them will simply learn to always emit low scores since
+they never appear as targets.
+
+### Why I didn't fix this
+**Option A (taken):** leave `n_bond_types=6`, waste 3 logits.
+- Pro: zero code changes to `get_n_bond_types`, `BOND_MASK_INDEX`, model.
+- Pro: if you later add multi-class edges, the slots are already there.
+- Con: slightly wasteful compute (3 extra logits per N² pair).
+
+**Option B (rejected):** thread `n_bond_types=2` through as a CLI override and
+also move `BOND_MASK_INDEX` (currently the fixed value 5) to `n_bond_types - 1`.
+- Pro: clean, no wasted capacity.
+- Con: touches more files; `BOND_MASK_INDEX` is imported by name in
+  `train.py`, `fm.py`'s `Integrator`, and the interpolant. Introduces risk.
+
+For a baseline where getting-it-running is the priority, Option A is the
+right tradeoff. Flagging here for anyone who wants to squeeze efficiency.
+
+### Why this is still correct
+The model sees the ground-truth adjacency with class 0 (no-edge) and class 1
+(edge). Cross-entropy with `n_bond_types=6` logits is well-defined: the
+softmax normalizes over all 6 dimensions, and the CE target is always 0 or 1.
+Gradients for dimensions 2/3/4 just push those logits downward uniformly
+(they'll converge to very negative values). Nothing breaks.
+
+---
+
+## 7. File-by-File Change Summary
+
+### Added
+| Path                                           | Role                                                         |
+|------------------------------------------------|--------------------------------------------------------------|
+| `semlaflow/data/swc.py`                        | Parse SWC → build `GeometricMol` directly (no RDKit).        |
+| `semlaflow/preprocess_neurons.py`              | Walk `neurons_final/{train, val_extended}`, emit `.smol`.    |
+| `semlaflow/models/neuron_cfm.py`               | `NeuronCFM(MolecularCFM)` — strips RDKit metrics.            |
+| `COMPATIBLE.md`                                | This file.                                                   |
+
+### Modified
+| Path                                           | Change                                                                                    |
+|------------------------------------------------|-------------------------------------------------------------------------------------------|
+| `semlaflow/scriptutil.py`                      | Added `NEURON_COORDS_STD_DEV`, `NEURON_BUCKET_LIMITS`, `build_neuron_vocab`, `neuron_mol_transform`. |
+| `semlaflow/train.py`                           | `--dataset neurons` branch in `build_dm`, `build_model`, `main`, `build_trainer`. Swap to `NeuronCFM`. Monitor `val-loss` for checkpointing. Skip `train_smiles` for neurons. |
+| `semlaflow/data/datamodules.py`                | macOS compat: fall back from `os.sched_getaffinity` to `os.cpu_count()`.                  |
+
+### Untouched (for good reason)
+- `semlaflow/models/semla.py` — architecture; data-agnostic.
+- `semlaflow/models/fm.py` — flow-matching + losses; data-agnostic.
+- `semlaflow/data/interpolate.py` — interpolant; data-agnostic.
+- `semlaflow/data/datasets.py` — `.smol` loader; data-agnostic.
+- `semlaflow/util/molrepr.py` — `GeometricMol`/`GeometricMolBatch`; data-agnostic.
+- `semlaflow/util/functional.py` — padding, CoM, rotations; data-agnostic.
+- `semlaflow/util/rdkit.py` — untouched (imported but RDKit code paths
+  are never hit on the neuron code path; it's still imported by modules like
+  `molrepr.py`, which is why you still need `rdkit` in the env).
+
+---
+
+## 8. End-to-End Data Flow (For Audit)
+
+Tracing a single batch from SWC files all the way to a training loss, so you
+can spot-check every step:
+
+```
+neurons_final/train/*.swc                                 (16,639 files)
+        │
+        ▼  parse_swc (line-by-line text parser)
+(coords [N,3] tuples, edges [(parent, child), ...], root_id)
+        │
+        ▼  swc_to_geometric_mol
+GeometricMol:
+  coords       = torch.tensor [N, 3], float32
+  atomics      = torch.full((N,), 2, long)     ← NODE token index
+  bond_indices = torch.tensor [N-1, 2], long   ← parent→child pairs
+  bond_types   = torch.ones (N-1,), long       ← class "1" = edge
+  charges      = torch.zeros (N,), long
+        │
+        ▼  GeometricMolBatch.to_bytes → pickle → .smol file
+train.smol, val.smol
+        │
+        ▼  GeometricDataset.load(..., transform=neuron_mol_transform)
+(each __getitem__:)
+  rotate(random 3D rotation)
+  scale(1/62.6894)
+  zero_com()
+  atomics: [N] → [N, 3] one-hot
+  bond_types: [N-1] → [N-1, 6] one-hot
+        │
+        ▼  GeometricInterpolantDM._batch_to_dict (collate)
+  pad to max(N_in_batch)
+  expand bonds to dense [N, N, 6] adjacency via adj_from_edges(symmetric=True)
+  charges: [N] → [N, 7] one-hot
+(now have dict: coords[B,N,3], atomics[B,N,3], bonds[B,N,N,6],
+                charges[B,N,7], mask[B,N])
+        │
+        ▼  GeometricInterpolant.forward
+Sample t ∈ [0,1]; build interpolated = lerp(prior, data, t).
+Prior = (Gaussian coords, all-mask atomics/bonds/charges).
+Output: (prior_dict, data_dict, interpolated_dict, times)
+        │
+        ▼  MolecularCFM (aka NeuronCFM).training_step
+forward(interpolated, times) → (coords_pred, atomics_logits, bonds_logits, charges_logits)
+losses = _loss(data, interpolated, predicted):
+  coord_loss  = MSE(pred_coords, data_coords) * mask                  [weight=1]
+  type_loss   = CE(atomics_logits, argmax(data_atomics))              [weight=0]  ← zeroed
+  bond_loss   = CE(bonds_logits, argmax(data_bonds))                  [weight=1]
+  charge_loss = CE(charges_logits, argmax(data_charges))              [weight=0]  ← zeroed
+loss = sum(weighted losses) → backward → step
+```
+
+Verified in the smoke test (see §10).
+
+---
+
+## 9. Known Limitations / What You'll Still Need to Build
+
+These are explicitly **not** adapted; the baseline is training-only.
+
+1. **Sampling/inference (`semlaflow/predict.py`)** still calls
+   `_generate_mols` → RDKit. To sample neurons, write a new script that:
+   a. Calls `model._generate(prior_batch, steps)` to get the generated tensors.
+   b. For each item, extracts `argmax(bonds)` — class 1 = edge, else no edge.
+   c. Builds an adjacency matrix, computes connected components, and writes an
+      SWC file (or whatever you want).
+   d. Handles the "dropped no-edge pairs leave a non-tree graph" case
+      gracefully (spanning tree? largest connected component? report cycles?).
+
+2. **Evaluation (`semlaflow/evaluate.py`)** is chemistry-only. For neurons
+   you'll want MMD over degree distributions, TMD distance if you have TMD
+   embeddings, graph-edit-distance to nearest training neuron, etc. None of
+   these are in SemlaFlow; they live in `dendrite_gen` tooling.
+
+3. **Tree-structure invariants are not enforced.** The baseline will produce
+   disconnected components, cycles, high-degree nodes, etc. By design. That's
+   the baseline's weakness and your K-Root-Children approach's justification.
+
+4. **Node count N is an input, not generated.** At inference time you must
+   decide N (e.g. sample from the training-set size distribution). SemlaFlow
+   does not predict N.
+
+5. **No conditioning on root degree k.** Your K-Root approach conditions on
+   `num_root_children`; this baseline has no such hook. All generations will
+   have a freely-varying root degree.
+
+6. **E(3) equivariance includes reflections.** Your data presumably has an
+   anatomical "up" (the SO(2)-axis in your config); this baseline doesn't
+   respect that. It'll happily produce upside-down neurons. Acceptable for a
+   baseline; noted.
+
+---
+
+## 10. Verification Performed
+
+Before declaring this done, I verified on the actual corpus:
+
+- **SWC parsing correctness:** one file → 50 nodes, 49 edges, root at id=1,
+  all non-root degrees ≤ 3, file IDs contiguous 1..N. All match SWC spec.
+- **Round-trip:** `GeometricMol.to_bytes → from_bytes` preserves `coords`
+  (`torch.allclose` passes) and `bond_indices` (exact equality).
+- **Dense adjacency shape:** for N=50, adjacency is [50, 50] with 98 nonzeros
+  (2×49, symmetric, one per edge direction).
+- **Preprocess end-to-end:** 16,639 train / 1,847 val graphs serialized to
+  `.smol`. 1 val graph > 256 nodes dropped. Measured `coord_std = 62.6894`.
+  Round-trip check on first mol passed.
+- **Transform output:** for dataset items 0, 100, 1000: post-transform CoM is
+  `~[1e-7, 1e-7, 1e-7]` (numerically zero), std is 1.03–1.41 (close to 1 as
+  expected — individual trees vary around the global mean).
+- **Batch shapes:** one training batch (size 16, max 72 nodes in bucket):
+  `coords[16, 72, 3]`, `atomics[16, 72, 3]`, `bonds[16, 72, 72, 6]`,
+  `charges[16, 72, 7]`, `mask[16, 72]`.
+- **Atomics class check:** real-node positions all have `argmax == 2` (NODE);
+  padded positions all have `argmax == 0` (PAD). Correct.
+- **Bond class check:** dense adjacency contains only classes {0, 1} as
+  expected (no stray 2/3/4/5 showing up where they shouldn't).
+- **Bucketing:** 9 buckets with counts [1858, 5054, 4679, 2338, 1631, 894, 165, 17, 3], summing to 16,639 (full train set, nothing lost).
+
+What I could **not** verify locally:
+- Full training loop (macOS doesn't support the Linux-native multiprocessing
+  `spawn` start method for dataloader workers with `threading.Lock` objects
+  in the dataset — a pre-existing SemlaFlow issue unrelated to the adapter).
+  On Linux + GPU this won't occur.
+- Actual generation quality (requires training to convergence + a sampling
+  script; see §9).
+
+---
+
+## 11. Suggested First Training Command
+
+```bash
+python -m semlaflow.train \
+  --data_path /Users/umer/Documents/neurons_final/smol \
+  --dataset neurons \
+  --max_atoms 220 \
+  --type_loss_weight 0.0 \
+  --charge_loss_weight 0.0 \
+  --bond_loss_weight 1.0 \
+  --categorical_strategy mask \
+  --epochs 300 \
+  --lr 3e-4 \
+  --batch_cost 4096 \
+  --optimal_transport equivariant
+```
+
+Rationale:
+- `--type_loss_weight 0.0`: single node type, no signal.
+- `--charge_loss_weight 0.0`: all-zero charges, no signal.
+- `--bond_loss_weight 1.0`: topology is the learning target.
+- `--categorical_strategy mask`: class-imbalanced "mostly no-edge" is handled
+  cleanly (see §4.3).
+- `--max_atoms 220`: covers all observed training graphs.
+
+Start with a trial run first:
+
+```bash
+python -m semlaflow.train --trial_run \
+  --data_path /Users/umer/Documents/neurons_final/smol \
+  --dataset neurons \
+  --max_atoms 220 \
+  --type_loss_weight 0.0 --charge_loss_weight 0.0 --bond_loss_weight 1.0 \
+  --categorical_strategy mask
+```
+
+to smoke-test the full loop (one epoch, no wandb) before committing compute.
+
+---
+
+## 12. TL;DR Compatibility Argument
+
+SemlaFlow's architecture treats the domain as: *3D points + invariant per-node
+categoricals + invariant per-edge categoricals + E(3) equivariance*. Neurons
+are exactly that structure with impoverished categoricals (one class each).
+The adaptation therefore reduces to: (1) data format conversion, (2) dummy
+vocab, (3) zero-weight the losses that have no signal, (4) replace the
+RDKit-flavored validation metrics with loss-based validation. The flow-
+matching math, the equivariance guarantees, and the optimization pipeline are
+unchanged — which is why I'm confident this will train and produce
+*something*. Whether that "something" is a useful baseline depends on how
+badly it violates the implicit tree invariants (degree cap, connectivity,
+acyclicity) — and that's precisely the experiment you want to run.
+
+---
+
+## Appendix A: Mechanics Deep-Dive
+
+This appendix unpacks three mechanisms often conflated: the `mask` categorical
+strategy, the roles of `<PAD>` vs `<MASK>` in the vocab, and the sparse→dense
+handling of bond indices. Every claim below is tied to a specific file and
+line in the SemlaFlow source.
+
+### A.1 The `mask` categorical strategy, end-to-end
+
+This is **Discrete Flow Matching (DFM)** with an absorbing "mask" state. Three
+moving parts: the prior, the interpolation, and the loss.
+
+#### A.1.1 The prior (`data/interpolate.py:100-102`)
+```python
+elif self.type_noise == "mask":
+    atomics = torch.zeros((n_atoms, self.vocab_size), dtype=torch.float32)
+    atomics[:, self.type_mask_index] = 1.0
+```
+At `t=0` (pure noise), **every node is one-hot at the `<MASK>` index**. For
+bonds, same thing — every pair in the dense adjacency is set to the mask
+class (index 5 for bonds when `categorical_strategy="mask"`). Coords are
+standard Gaussian in parallel; the discrete and continuous priors are
+independent.
+
+#### A.1.2 The interpolation at time t (`data/interpolate.py:303-308`, 316-321)
+```python
+elif self.type_interpolation == "unmask":
+    atom_mask = torch.rand(from_mol.seq_length) > t
+    to_atomics = torch.argmax(to_mol.atomics, dim=-1)
+    from_atomics = torch.argmax(from_mol.atomics, dim=-1)
+    to_atomics[atom_mask] = from_atomics[atom_mask]
+    atomics = one_hot_encode_tensor(to_atomics, ...)
+```
+For each node (or pair, independently), flip a biased coin:
+- With probability `t`, keep the **real** token (from data).
+- With probability `(1-t)`, revert to the **mask** token (from prior).
+
+At `t=0` everything is mask. At `t=1` everything is revealed. The forward
+process is literally just random per-token unmasking. Each node is unmasked
+independently of all others — no structure in the noising.
+
+#### A.1.3 The loss on masked positions only (`models/fm.py:818-823`, 840-842)
+```python
+if self.type_strategy == "mask":
+    masked_types = torch.argmax(interpolated["atomics"], dim=-1) == self.type_mask_index
+    n_atoms = masked_types.sum(dim=-1) + eps
+    type_loss = type_loss * masked_types.float().unsqueeze(-1)
+```
+Cross-entropy is **only computed on positions that are currently masked** in
+the interpolated view. Positions already revealed at time `t` contribute zero
+gradient — the model isn't asked to "predict" them again. Normalization is by
+the number of masked positions (`n_atoms`), not total positions.
+
+The analogous bond loss (`fm.py:840-842`) does the same thing at the
+`(i, j)` pair level.
+
+#### A.1.4 Why this matters specifically for neurons
+The bond tensor is *dominated* by the no-edge class 0. For a tree with
+N nodes, 2(N-1) positions out of N² are edges — ~4% for N=50, ~1% for N=220.
+
+With the alternative `uniform-sample` strategy (which computes CE on every
+pair unconditionally), the model gets an easy-win signal "predict 0
+everywhere" and the gradient on the rare class 1 gets averaged down by the
+abundant class 0. With `mask`, the model is explicitly asked "given these
+pairs are masked, predict their class" — so class imbalance doesn't
+marginalize the rare-but-important edge signal.
+
+Alternatives are still valid; `mask` is just the most sample-efficient
+default for class-imbalanced structure, which is why the suggested training
+command uses it.
+
+#### A.1.5 What sampling looks like (for completeness, not used during training)
+The `Integrator` (`fm.py`) reverses the process: start with all-mask, predict
+logits per position, sample from the softmax, unmask a fraction proportional
+to the step size, repeat. At `t=1` everything is decided. The sampling side
+isn't wired for neurons yet (see §9) but the math is identical.
+
+### A.2 `<PAD>` vs `<MASK>` — two different jobs
+
+Easy to conflate; they do different things and live in different scopes.
+
+#### A.2.1 `<PAD>` (vocab index 0): a **batching** concern
+Different neurons in one batch have different N (e.g. [40, 37, 45]). The
+datamodule pads them up to the max in the bucket — say 72. Padded positions
+need *some* value in every tensor; `<PAD>` is that filler token.
+
+- `data["atomics"]` has shape `[B, 72, 3]`. For a graph with only 45 real
+  nodes, positions 45..71 get atomics `[1, 0, 0]` (one-hot at `<PAD>` = 0).
+- The `mask` tensor `[B, 72]` has 1 for real positions and 0 for padded.
+- **Losses are multiplied by this mask** (see `_type_loss`, `_bond_loss`,
+  `_charge_loss` in `fm.py`). Padded positions never contribute gradient.
+
+The model *sees* `<PAD>` nodes in the forward pass (they participate in
+attention and message passing) but because their gradient contribution is
+zeroed, it learns to treat them as inert. Verified in the smoke test:
+```
+real-node atomics all 2: True   # argmax == NODE token
+padded atomics all 0: True      # argmax == PAD token
+```
+
+#### A.2.2 `<MASK>` (vocab index 1): a **DFM** concern
+This is the absorbing state in discrete flow matching (see A.1). It
+represents "this token hasn't been decided yet; the model must predict it."
+It only appears in the *interpolated* view (the noisy intermediate between
+prior and data), never in the data itself. It's a flow-matching concept, not
+a batching concept.
+
+Orthogonality to PAD: a padded position never flips to MASK (it has no real
+token for DFM to try to reveal); a real position can be MASK at time t and
+NODE at time t+dt. The two tokens live in the same vocabulary slot count
+because they're both just possible one-hot values the model may receive as
+input, but they're produced by different pipelines.
+
+#### A.2.3 How the one-hot feeds into the model (`models/fm.py:520-521`)
+The transform produces atomics as `[N, vocab_size]` one-hot. Collation stacks
+these to `[B, N, vocab_size]`. Then in `MolecularCFM.forward`:
+```python
+times = t.view(-1, 1, 1).expand(-1, coords.size(1), -1)  # [B, N, 1]
+features = torch.cat((times, atom_types), dim=2)         # [B, N, V+1]
+```
+For neurons, `V=3`, so the per-node invariant feature vector has
+**4 dimensions**: `[t, one_hot_PAD, one_hot_MASK, one_hot_NODE]`. These
+features are passed into `SemlaGenerator` as the scalar (rotation-invariant)
+stream that flows alongside the equivariant coordinate stream.
+
+| Node state                     | Feature vector          |
+|--------------------------------|-------------------------|
+| Real node (always, for neurons) | `[t, 0, 0, 1]`          |
+| Padded node                    | `[t, 1, 0, 0]`          |
+| Node currently masked in DFM   | `[t, 0, 1, 0]`          |
+
+Because `type_loss_weight=0.0` on neurons, the model's **predicted** atom-
+type logits are discarded (not used for gradient) — but the atom-type **input
+features** still exist and still carry the PAD/MASK/NODE distinction the
+model needs to function. You can't just set the feature dim to 0; you need
+at least those three tokens even though the vocab is degenerate.
+
+(An analogous argument applies to edges: `<BOND_MASK>` at index 5 plays the
+same role for bonds that `<MASK>` plays for atoms. The implicit "no-edge"
+class 0 is just absence — see A.3.)
+
+### A.3 Bond indices: sparse storage, dense densification, implicit class 0
+
+At storage time, bond_indices are a **sparse** edge list. At train time,
+they're implicitly expanded to a **dense** N×N tensor. "No-edge" is class 0
+by construction.
+
+#### A.3.1 Storage (GeometricMol, my adapter)
+```python
+bond_indices = [[parent_0, child_0], [parent_1, child_1], ...]   # [N-1, 2]
+bond_types   = [1, 1, 1, ..., 1]                                  # [N-1]
+```
+**Only edges that exist** are recorded. No-edge is never stored explicitly —
+it's defined by absence. Serialised into `.smol` as-is (see `to_bytes`).
+
+#### A.3.2 Densification at collate time (`data/datamodules.py:196` → `util/molrepr.py:644-648`)
+```python
+adjs = [
+    adj_from_edges(mol.bond_indices, mol.bond_types, n_atoms, symmetric=True)
+    for mol in self._mols
+]
+```
+`adj_from_edges` initializes an N×N×n_bond_types tensor of zeros, then writes
+`bond_types[i]` at `adj[from, to]` and (via `symmetric=True`) also at
+`adj[to, from]`. Every other position stays zero.
+
+After one-hot encoding (done in `neuron_mol_transform`), `bond_types` is
+`[N-1, 6]` one-hot-at-class-1. So the dense adjacency becomes:
+
+| Position                    | Value                           | Count        |
+|-----------------------------|---------------------------------|--------------|
+| Real edge (either direction) | `[0, 1, 0, 0, 0, 0]`            | 2(N-1)       |
+| Diagonal `(i, i)`           | `[0, 0, 0, 0, 0, 0]`            | N            |
+| All other pairs             | `[0, 0, 0, 0, 0, 0]`            | N² − 2(N-1) − N |
+
+#### A.3.3 How the loss target falls out (`models/fm.py:829`)
+```python
+bonds = torch.argmax(data["bonds"], dim=-1)   # [B, N, N]
+```
+- Real-edge positions: `argmax([0,1,0,0,0,0]) = 1` → "edge" class
+- Absent-pair positions: `argmax([0,0,0,0,0,0]) = 0` → "no-edge" class
+  (argmax breaks ties by taking the first index, which is 0)
+
+So **bond_indices are kept purely to flag which pairs are edges; everything
+else falls into class 0 by construction.** The model's output head produces
+`[B, N, N, 6]` logits and the CE loss matches them against this implicit
+"absence = 0" target.
+
+#### A.3.4 Two wrinkles worth knowing
+
+**(a) Self-loops.** The diagonal `adj[i, i]` is never written (a node doesn't
+have a self-edge in my adapter), so it stays all zeros → argmax 0 → "no-edge"
+target. Correct; a node is not its own parent. Note that in `_bond_loss` the
+loss is masked by `adj_from_node_mask(..., self_connect=True)`
+(`fm.py:835`), which *does* include the diagonal — so the model is trained
+to predict "no-edge" on the diagonal too. Harmless; this just makes "no self-
+loops" a learned constraint rather than a structural one.
+
+**(b) Interpolated vs data representation.** In the **data** mol,
+`bond_indices` is sparse (the `N-1` real edges). But inside
+`GeometricInterpolant._interpolate_mol` (`interpolate.py:323-324`):
+```python
+bond_indices = torch.ones((N, N)).nonzero()
+bond_types = interp_adj[bond_indices[:, 0], bond_indices[:, 1]]
+```
+The **interpolated** mol stores a dense N² bond list — after mask-noise is
+applied, most pairs have non-trivial "bond types" (either mask class 5 or a
+revealed data value) and you can't encode that sparsely. So the sparse-vs-
+dense distinction is a quirk of the data path; at the model input,
+everything is dense `[B, N, N, 6]` either way.
+
+#### A.3.5 Why this is efficient
+For a tree with N=100, storage cost:
+- Sparse: `N-1 = 99` edges × 2 cols = 198 entries.
+- Dense one-hot: `N² × n_bond_types = 100 × 100 × 6 = 60,000` entries.
+
+A ~300× reduction on disk. The dense form is only realised transiently in
+GPU memory per batch. For larger trees (your N=220 upper end) the savings
+grow quadratically. This is the same reason SemlaFlow serialises molecules
+this way in the first place — molecules are sparse graphs too.
