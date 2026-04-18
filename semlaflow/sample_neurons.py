@@ -264,17 +264,25 @@ def main(args):
 
     test_dl = dm.test_dataloader()
     all_mols: list[GeometricMol] = []
+    raw_batches: list[dict] = []
     for batch in tqdm(test_dl):
         prior = {k: v.to(device) for k, v in batch[0].items()}
         with torch.no_grad():
             output = model._generate(prior, args.integration_steps, args.ode_sampling_strategy)
         all_mols.extend(samples_to_mols(output, edge_class_index=NEURON_EDGE_CLASS_INDEX))
+        if args.save_raw:
+            raw_batches.append({k: v.detach().cpu() for k, v in output.items()})
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     out_path = save_dir / args.save_file
     out_path.write_bytes(GeometricMolBatch.from_list(all_mols).to_bytes())
     print(f"Wrote {len(all_mols)} samples -> {out_path}")
+
+    if args.save_raw:
+        raw_path = out_path.with_suffix(".raw.pt")
+        torch.save(raw_batches, raw_path)
+        print(f"Wrote raw model outputs (bonds/atomics/coords/mask) -> {raw_path}")
 
     # Cheap round-trip sanity (not a full stats pass).
     rt = GeometricMolBatch.from_bytes(out_path.read_bytes())
@@ -298,6 +306,9 @@ if __name__ == "__main__":
     parser.add_argument("--ode_sampling_strategy", type=str, default=DEFAULT_ODE_SAMPLING_STRATEGY)
     parser.add_argument("--bucket_cost_scale", type=str, default=DEFAULT_BUCKET_COST_SCALE)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--save_raw", action="store_true",
+                        help="Also dump raw per-batch model outputs (coords/atomics/bonds/mask) "
+                             "as <save_file>.raw.pt for diagnostics.")
 
     args = parser.parse_args()
     main(args)
