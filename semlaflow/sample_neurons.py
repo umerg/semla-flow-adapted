@@ -92,10 +92,12 @@ def load_model(args, vocab):
 
     type_mask_index = (
         vocab.indices_from_tokens(["<MASK>"])[0]
-        if hparams["train-type-interpolation"] == "mask"
+        if hparams["integration-type-strategy"] == "mask"
         else None
     )
-    bond_mask_index = util.BOND_MASK_INDEX if hparams["train-bond-interpolation"] == "mask" else None
+    bond_mask_index = (
+        util.BOND_MASK_INDEX if hparams["integration-bond-strategy"] == "mask" else None
+    )
 
     integrator = Integrator(
         args.integration_steps,
@@ -142,10 +144,12 @@ def build_dm(args, hparams, vocab):
 
     type_mask_index = (
         vocab.indices_from_tokens(["<MASK>"])[0]
-        if hparams["val-type-interpolation"] == "mask"
+        if hparams["val-prior-type-noise"] == "mask"
         else None
     )
-    bond_mask_index = util.BOND_MASK_INDEX if hparams["val-bond-interpolation"] == "mask" else None
+    bond_mask_index = (
+        util.BOND_MASK_INDEX if hparams["val-prior-bond-noise"] == "mask" else None
+    )
 
     prior_sampler = GeometricNoiseSampler(
         vocab.size,
