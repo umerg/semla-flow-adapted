@@ -16,6 +16,7 @@ noise-sampled prior of matching shape.
 from __future__ import annotations
 
 import argparse
+import json
 from functools import partial
 from pathlib import Path
 
@@ -43,6 +44,7 @@ DEFAULT_INTEGRATION_STEPS = 100
 DEFAULT_CAT_SAMPLING_NOISE_LEVEL = 1
 DEFAULT_ODE_SAMPLING_STRATEGY = "log"
 DEFAULT_SEED = 12345
+DEFAULT_N_PLOT_EXAMPLES = 8
 
 
 def _device() -> torch.device:
@@ -240,6 +242,89 @@ def samples_to_mols(output, edge_class_index: int) -> list[GeometricMol]:
     return mols
 
 
+def _split_path(data_path: str, split: str) -> Path:
+    fname = {"train": "train.smol", "val": "val.smol", "test": "test.smol"}.get(split)
+    if fname is None:
+        raise ValueError(f"Unknown dataset_split '{split}'")
+    return Path(data_path) / fname
+
+
+def evaluate_samples(args, gen_mols: list[GeometricMol], save_dir: Path) -> None:
+    """Compare generated graphs against the ground-truth split: distribution metrics
+    (Wasserstein-1 per structural stat) written to metrics.json + printed, and
+    multi-azimuth plot grids of generated and GT samples saved as PNGs.
+
+    Imports are local so the pure sampling path (and `--skip_eval`) pulls in no
+    networkx/matplotlib.
+    """
+    import matplotlib.pyplot as plt
+
+    from semlaflow.validation.convert import geometric_mol_to_nx
+    from semlaflow.validation.dist_metrics import METRIC_KEYS, compute_distribution_metrics
+    from semlaflow.validation.plot import plot_graph_grid_angles
+
+    gt_path = _split_path(args.data_path, args.dataset_split)
+    if not gt_path.exists():
+        print(f"[eval] ground-truth split '{gt_path}' not found; skipping metrics/plots.")
+        return
+
+    # Ground-truth real graphs (untransformed -> original physical-micron coords).
+    gt_dataset = GeometricDataset.load(gt_path, transform=None)
+    gt_mols = [gt_dataset[i] for i in range(len(gt_dataset))]
+    print(f"[eval] generated={len(gen_mols)} vs ground-truth({args.dataset_split})={len(gt_mols)}")
+
+    # Generated coords are standardised (./std); unscale to physical microns to match GT.
+    coord_std = util.NEURON_COORDS_STD_DEV
+    gen_graphs = [geometric_mol_to_nx(m, coord_scale=coord_std) for m in gen_mols]
+    gt_graphs = [geometric_mol_to_nx(m, coord_scale=1.0) for m in gt_mols]
+
+    import networkx as nx
+
+    def _disconnected_frac(graphs):
+        if not graphs:
+            return 0.0
+        n_disc = sum(1 for g in graphs if g.number_of_nodes() > 0 and not nx.is_connected(g))
+        return n_disc / len(graphs)
+
+    gen_disc = _disconnected_frac(gen_graphs)
+    if gen_disc > 0:
+        print(f"[eval] note: {gen_disc:.1%} of generated graphs are disconnected "
+              "(root-based stats only cover the root's component).")
+
+    metrics = compute_distribution_metrics(gen_graphs, gt_graphs)
+    metrics["generated_disconnected_frac"] = gen_disc
+    metrics["n_generated"] = float(len(gen_graphs))
+    metrics["n_ground_truth"] = float(len(gt_graphs))
+
+    metrics_path = save_dir / "metrics.json"
+    metrics_path.write_text(json.dumps(metrics, indent=2))
+    print(f"[eval] wrote metrics -> {metrics_path}")
+
+    print(f"\n[eval] distribution metrics (Wasserstein-1; lower is better)")
+    print(f"{'Metric':<26}Value")
+    print("-" * 38)
+    for key in METRIC_KEYS:
+        print(f"{key:<26}{metrics[key]:.4f}")
+    print()
+
+    # Multi-azimuth plot grids: generated and GT references at the same angles.
+    n = min(args.n_plot_examples, len(gen_graphs))
+    gen_fig, gen_png = plot_graph_grid_angles(
+        gen_graphs[:n], out_dir=save_dir, stem=Path(args.save_file).stem,
+        file_tag="gen3d", title_prefix="Gen", max_graphs=n,
+    )
+    plt.close(gen_fig)
+    print(f"[eval] wrote generated plot grid -> {gen_png}")
+
+    n_gt = min(args.n_plot_examples, len(gt_graphs))
+    ref_fig, ref_png = plot_graph_grid_angles(
+        gt_graphs[:n_gt], out_dir=save_dir, stem=Path(args.save_file).stem,
+        file_tag="ref3d", title_prefix="GT", node_color="#1f77b4", max_graphs=n_gt,
+    )
+    plt.close(ref_fig)
+    print(f"[eval] wrote ground-truth plot grid -> {ref_png}")
+
+
 def main(args):
     print(f"Sampling {args.n_molecules} neuron graphs...")
     print(f"Checkpoint: {args.ckpt_path}")
@@ -288,6 +373,11 @@ def main(args):
     rt = GeometricMolBatch.from_bytes(out_path.read_bytes())
     assert len(rt) == len(all_mols), "round-trip count mismatch"
     print("Round-trip OK.")
+
+    if not args.skip_eval:
+        print("Evaluating samples (structural metrics + plots)...")
+        evaluate_samples(args, all_mols, save_dir)
+
     print("Done.")
 
 
@@ -309,6 +399,10 @@ if __name__ == "__main__":
     parser.add_argument("--save_raw", action="store_true",
                         help="Also dump raw per-batch model outputs (coords/atomics/bonds/mask) "
                              "as <save_file>.raw.pt for diagnostics.")
+    parser.add_argument("--skip_eval", action="store_true",
+                        help="Skip post-sampling structural metrics + plots (pure sampling only).")
+    parser.add_argument("--n_plot_examples", type=int, default=DEFAULT_N_PLOT_EXAMPLES,
+                        help="Number of generated/GT samples per multi-azimuth plot grid.")
 
     args = parser.parse_args()
     main(args)
