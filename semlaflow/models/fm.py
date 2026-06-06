@@ -515,6 +515,7 @@ class MolecularCFM(L.LightningModule):
         atom_types = batch["atomics"]
         bonds = batch["bonds"]
         mask = batch["mask"]
+        cond_tmd = batch.get("tmd")  # per-graph conditioning vector; None when unused
 
         # Prepare invariant atom features
         times = t.view(-1, 1, 1).expand(-1, coords.size(1), -1)
@@ -534,11 +535,12 @@ class MolecularCFM(L.LightningModule):
                 cond_coords=cond_batch["coords"],
                 cond_atomics=cond_batch["atomics"],
                 cond_bonds=cond_batch["bonds"],
-                atom_mask=mask
+                atom_mask=mask,
+                cond_tmd=cond_tmd,
             )
 
         else:
-            out = model(coords, features, edge_feats=bonds, atom_mask=mask)
+            out = model(coords, features, edge_feats=bonds, atom_mask=mask, cond_tmd=cond_tmd)
 
         return out
 

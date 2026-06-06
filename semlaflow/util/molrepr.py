@@ -271,6 +271,7 @@ class GeometricMol(SmolMol):
         device: Optional[TDevice] = None,
         is_mmap: bool = False,
         str_id: Optional[str] = None,
+        tmd: Optional[_T] = None,
     ):
         # Check that each tensor has correct number of dimensions
         _check_shape_len(coords, 2, "coords")
@@ -305,6 +306,9 @@ class GeometricMol(SmolMol):
         self._bond_types = bond_types
         self._charges = charges
         self._device = device
+        # Optional per-graph conditioning vector (e.g. TMD). Carried through transforms,
+        # batching, and (de)serialization untouched; None when unused.
+        self._tmd = tmd
 
         # If the data are not stored in mmap tensors, then convert to expected type and move to device
         if not is_mmap:
@@ -365,6 +369,13 @@ class GeometricMol(SmolMol):
     def charges(self) -> _T:
         return self._charges.long().to(self._device)
 
+    @property
+    def tmd(self) -> Optional[_T]:
+        """Optional per-graph conditioning vector (e.g. TMD), or None if unset."""
+        if self._tmd is None:
+            return None
+        return torch.as_tensor(self._tmd).float()
+
     # Note: this will always return a symmetric NxN matrix
     @property
     def adjacency(self) -> _T:
@@ -410,6 +421,7 @@ class GeometricMol(SmolMol):
             device=obj["device"],
             is_mmap=False,
             str_id=obj["id"],
+            tmd=obj.get("tmd"),  # backward compatible: old .smol files have no TMD
         )
         return mol
 
@@ -459,6 +471,7 @@ class GeometricMol(SmolMol):
             "charges": self.charges,
             "device": str(self.device),
             "id": self._str_id,
+            "tmd": None if self._tmd is None else torch.as_tensor(self._tmd).cpu(),
         }
         byte_obj = pickle.dumps(dict_repr, protocol=PICKLE_PROTOCOL)
         return byte_obj
@@ -486,6 +499,7 @@ class GeometricMol(SmolMol):
         bond_indices: Optional[_T] = None,
         bond_types: Optional[_T] = None,
         charges: Optional[_T] = None,
+        tmd: Optional[_T] = None,
     ) -> GeometricMol:
 
         coords = self.coords if coords is None else coords
@@ -493,6 +507,8 @@ class GeometricMol(SmolMol):
         bond_indices = self.bond_indices if bond_indices is None else bond_indices
         bond_types = self.bond_types if bond_types is None else bond_types
         charges = self.charges if charges is None else charges
+        # Preserve the conditioning vector across transforms unless explicitly replaced.
+        tmd = self._tmd if tmd is None else tmd
 
         obj = GeometricMol(
             coords,
@@ -503,6 +519,7 @@ class GeometricMol(SmolMol):
             device=self.device,
             is_mmap=False,
             str_id=self._str_id,
+            tmd=tmd,
         )
         return obj
 

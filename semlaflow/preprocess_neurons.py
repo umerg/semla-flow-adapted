@@ -34,7 +34,8 @@ def _list_swc(dir_path: Path) -> list[Path]:
     ]
 
 
-def _convert(files: list[Path], max_atoms: int, split_name: str):
+def _convert(files: list[Path], max_atoms: int, split_name: str, compute_tmd: bool = False,
+             tmd_filtrations: tuple = ("path",)):
     mols = []
     dropped = 0
     for f in tqdm(files, desc=f"parsing {split_name}"):
@@ -42,6 +43,10 @@ def _convert(files: list[Path], max_atoms: int, split_name: str):
         if mol.seq_length > max_atoms:
             dropped += 1
             continue
+        if compute_tmd:
+            from semlaflow.tmd import compute_neuron_tmd
+
+            mol._tmd = compute_neuron_tmd(mol, filtrations=tmd_filtrations)
         mols.append(mol)
     if dropped:
         print(f"[{split_name}] dropped {dropped} graphs with > {max_atoms} nodes")
@@ -80,6 +85,20 @@ def main():
         default=None,
         help="Subdir to use for validation. Auto-picks 'val_extended' if present, else 'val'.",
     )
+    parser.add_argument(
+        "--compute_tmd",
+        action="store_true",
+        help="Compute and store a per-graph TMD conditioning vector on each mol (for conditional "
+             "training/generation). Off by default => output is identical to the unconditional pipeline.",
+    )
+    parser.add_argument(
+        "--tmd_filtrations",
+        type=str,
+        nargs="+",
+        default=["path"],
+        choices=["path", "height", "rho"],
+        help="Filtrations for the TMD vector (default: path-only, rotation-invariant).",
+    )
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
@@ -100,8 +119,15 @@ def main():
     print(f"train files: {len(train_files)}")
     print(f"val   files: {len(val_files)}")
 
-    train_mols = _convert(train_files, args.max_atoms, "train")
-    val_mols = _convert(val_files, args.max_atoms, "val")
+    tmd_filtrations = tuple(args.tmd_filtrations)
+    if args.compute_tmd:
+        print(f"Computing TMD conditioning vectors (filtrations={tmd_filtrations})...")
+    train_mols = _convert(train_files, args.max_atoms, "train", args.compute_tmd, tmd_filtrations)
+    val_mols = _convert(val_files, args.max_atoms, "val", args.compute_tmd, tmd_filtrations)
+
+    if args.compute_tmd and train_mols:
+        tmd_dim = int(train_mols[0]._tmd.shape[0])
+        print(f"== TMD vector dim: {tmd_dim} == (pass --tmd_conditioning to train.py to use it)\n")
 
     coord_std = _coord_std(train_mols)
     size_hist = np.bincount([m.seq_length for m in train_mols])

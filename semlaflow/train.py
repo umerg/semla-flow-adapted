@@ -69,6 +69,20 @@ def build_model(args, dm, vocab):
     n_atom_feats = vocab.size + 1
     n_bond_types = util.get_n_bond_types(args.categorical_strategy)
 
+    # TMD conditioning: infer the vector width from the (preprocessed) training data.
+    tmd_dim = 0
+    tmd_hidden = 0
+    if getattr(args, "tmd_conditioning", False):
+        sample_mol = dm.train_dataset[0]
+        if getattr(sample_mol, "_tmd", None) is None:
+            raise ValueError(
+                "--tmd_conditioning was set but the training data has no TMD vectors. "
+                "Re-run preprocess_neurons.py with --compute_tmd."
+            )
+        tmd_dim = int(sample_mol.tmd.shape[0])
+        tmd_hidden = args.tmd_hidden
+        print(f"TMD conditioning enabled: tmd_dim={tmd_dim}, tmd_hidden={tmd_hidden}")
+
     if args.arch == "semla":
         dynamics = EquiInvDynamics(
             args.d_model,
@@ -92,6 +106,8 @@ def build_model(args, dm, vocab):
             self_cond=args.self_condition,
             size_emb=args.size_emb,
             max_atoms=args.max_atoms,
+            tmd_dim=tmd_dim,
+            tmd_hidden=tmd_hidden,
         )
 
     elif args.arch == "eqgat":
@@ -414,6 +430,11 @@ if __name__ == "__main__":
     parser.add_argument("--size_emb", type=int, default=DEFAULT_SIZE_EMB)
     parser.add_argument("--max_atoms", type=int, default=DEFAULT_MAX_ATOMS)
     parser.add_argument("--arch", type=str, default=DEFAULT_ARCH)
+    parser.add_argument("--tmd_conditioning", action="store_true",
+                        help="Condition generation on a per-graph TMD vector (requires data "
+                             "preprocessed with --compute_tmd). Off => unconditional, unchanged.")
+    parser.add_argument("--tmd_hidden", type=int, default=64,
+                        help="Hidden/projection dim for the TMD conditioning MLP (when enabled).")
 
     # Training args
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)

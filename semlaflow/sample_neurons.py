@@ -90,6 +90,8 @@ def load_model(args, vocab):
         self_cond=hparams["self_cond"],
         size_emb=hparams["size_emb"],
         max_atoms=hparams["max_atoms"],
+        tmd_dim=hparams.get("tmd_dim", 0),
+        tmd_hidden=hparams.get("tmd_hidden", 0),
     )
 
     type_mask_index = (
@@ -344,6 +346,26 @@ def main(args):
     print("Loading model...")
     model = load_model(args, vocab)
 
+    # TMD conditioning guards: keep ckpt and CLI flag consistent.
+    ckpt_conditional = getattr(model.gen, "tmd_dim", 0) > 0
+    if ckpt_conditional and not args.tmd_cond:
+        raise SystemExit(
+            "This checkpoint was trained with TMD conditioning (tmd_dim > 0). "
+            "Pass --tmd_cond to condition generation on the paired val graphs."
+        )
+    if args.tmd_cond and not ckpt_conditional:
+        raise SystemExit(
+            "--tmd_cond was set but this checkpoint has no TMD conditioning (tmd_dim = 0)."
+        )
+    if args.tmd_cond:
+        sample_mol = dm.test_dataset[0]
+        if getattr(sample_mol, "_tmd", None) is None:
+            raise SystemExit(
+                "--tmd_cond requires TMD vectors in the dataset, but none were found. "
+                "Re-run preprocess_neurons.py with --compute_tmd to regenerate the .smol."
+            )
+        print("TMD conditioning ON: conditioning on paired val-graph TMD vectors.")
+
     device = _device()
     model.eval().to(device)
     print(f"Model on {device}. Running generation...")
@@ -400,6 +422,10 @@ if __name__ == "__main__":
     parser.add_argument("--save_raw", action="store_true",
                         help="Also dump raw per-batch model outputs (coords/atomics/bonds/mask) "
                              "as <save_file>.raw.pt for diagnostics.")
+    parser.add_argument("--tmd_cond", action="store_true",
+                        help="Paired conditional generation: condition each sample on the real "
+                             "val graph's TMD vector. Requires a TMD-trained checkpoint and a "
+                             ".smol built with --compute_tmd.")
     parser.add_argument("--skip_eval", action="store_true",
                         help="Skip post-sampling structural metrics + plots (pure sampling only).")
     parser.add_argument("--n_plot_examples", type=int, default=DEFAULT_N_PLOT_EXAMPLES,

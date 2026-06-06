@@ -710,6 +710,7 @@ class MolecularGenerator(ABC, torch.nn.Module):
         cond_atomics=None,
         cond_bonds=None,
         atom_mask=None,
+        cond_tmd=None,
     ):
         pass
 
@@ -726,6 +727,8 @@ class SemlaGenerator(MolecularGenerator):
         self_cond=False,
         size_emb=64,
         max_atoms=256,
+        tmd_dim=0,
+        tmd_hidden=0,
     ):
 
         hparams = {
@@ -737,12 +740,16 @@ class SemlaGenerator(MolecularGenerator):
             "self_cond": self_cond,
             "size_emb": size_emb,
             "max_atoms": max_atoms,
+            "tmd_dim": tmd_dim,
+            "tmd_hidden": tmd_hidden,
             **dynamics.hparams,
         }
 
         super().__init__(**hparams)
 
         self.self_cond = self_cond
+        self.tmd_dim = tmd_dim
+        self.tmd_hidden = tmd_hidden
 
         if d_edge is not None or n_edge_types is not None:
             if None in [d_edge, n_edge_types]:
@@ -759,6 +766,18 @@ class SemlaGenerator(MolecularGenerator):
 
         in_feats = n_atom_feats + vocab_size if self_cond else n_atom_feats
         in_feats = in_feats + size_emb
+
+        # Optional global conditioning vector (e.g. TMD) projected and broadcast per-node,
+        # mirroring how size_emb is injected. Disabled when tmd_hidden == 0.
+        self.tmd_proj = None
+        if tmd_hidden > 0:
+            if tmd_dim <= 0:
+                raise ValueError("tmd_dim must be > 0 when tmd_hidden > 0.")
+            self.tmd_proj = torch.nn.Sequential(
+                torch.nn.Linear(tmd_dim, tmd_hidden), torch.nn.SiLU(inplace=False),
+                torch.nn.Linear(tmd_hidden, tmd_hidden),
+            )
+            in_feats = in_feats + tmd_hidden
 
         self.size_emb = torch.nn.Embedding(max_atoms, size_emb)
         self.feat_proj = torch.nn.Sequential(
@@ -783,6 +802,7 @@ class SemlaGenerator(MolecularGenerator):
         cond_atomics=None,
         cond_bonds=None,
         atom_mask=None,
+        cond_tmd=None,
     ):
         """Predict molecular coordinates and atom types
 
@@ -822,6 +842,19 @@ class SemlaGenerator(MolecularGenerator):
         size_emb = self.size_emb(n_atoms).expand(-1, inv_feats.size(1), -1)
 
         inv_feats = torch.cat((inv_feats, size_emb), dim=-1)
+
+        # Project the global conditioning vector (e.g. TMD) and broadcast it to every node,
+        # exactly as size_emb above. Required when the model was built with TMD conditioning.
+        if self.tmd_proj is not None:
+            if cond_tmd is None:
+                raise ValueError(
+                    "Model was initialised with TMD conditioning (tmd_hidden > 0) but cond_tmd "
+                    "was not provided. Ensure the batch carries a 'tmd' vector."
+                )
+            tmd_emb = self.tmd_proj(cond_tmd.float())
+            tmd_emb = tmd_emb.unsqueeze(1).expand(-1, inv_feats.size(1), -1)
+            inv_feats = torch.cat((inv_feats, tmd_emb), dim=-1)
+
         if cond_atomics is not None:
             inv_feats = torch.cat((inv_feats, cond_atomics), dim=-1)
 

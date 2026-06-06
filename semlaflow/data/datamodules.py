@@ -207,6 +207,13 @@ class GeometricDM(SmolDM):
             charges = smolF.one_hot_encode_tensor(charges, n_charges)
 
         data = {"coords": coords, "atomics": atomics, "bonds": bonds, "charges": charges, "mask": mask}
+
+        # Surface the per-graph conditioning vector (e.g. TMD) if every real mol carries one.
+        # Stacked from the real mols (the prepended fake pad mol is not in smol_batch).
+        real_mols = smol_batch.to_list()
+        if real_mols and all(mol._tmd is not None for mol in real_mols):
+            data["tmd"] = torch.stack([torch.as_tensor(mol._tmd) for mol in real_mols]).float()
+
         return data
 
     def _get_padded_size(self, smol_batch):

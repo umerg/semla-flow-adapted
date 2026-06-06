@@ -16,6 +16,8 @@ These rules are defined once here and reused by `dist_metrics` and `plot`.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import networkx as nx
 import numpy as np
 
@@ -75,13 +77,14 @@ def choose_root(G: nx.Graph, coords: np.ndarray) -> int:
     return pca_base_root(coords)
 
 
-def geometric_mol_to_nx(mol, *, coord_scale: float = 1.0) -> nx.Graph:
+def geometric_mol_to_nx(mol, *, coord_scale: float = 1.0, root: Optional[int] = None) -> nx.Graph:
     """Build an undirected networkx graph from a GeometricMol.
 
     Node `i` carries `pos = coords[i] * coord_scale` (length-3 np.float64); edges come
-    from `mol.bond_indices`; `G.graph["root"]` is set via `choose_root`. Pass
-    `coord_scale=NEURON_COORDS_STD_DEV` for generated (standardised) mols to recover
-    physical microns; leave `coord_scale=1.0` for ground-truth mols (already physical).
+    from `mol.bond_indices`. `G.graph["root"]` is set to `root` if given, else chosen via
+    `choose_root`. Pass `coord_scale=NEURON_COORDS_STD_DEV` for generated (standardised)
+    mols to recover physical microns; leave `coord_scale=1.0` for ground-truth mols
+    (already physical). Pass `root=0` for neuron mols where index 0 is the soma (per swc.py).
     """
     coords = _coords_array(mol, coord_scale)
     n = coords.shape[0]
@@ -96,5 +99,5 @@ def geometric_mol_to_nx(mol, *, coord_scale: float = 1.0) -> nx.Graph:
             continue
         G.add_edge(int(a), int(b))
 
-    G.graph["root"] = choose_root(G, coords)
+    G.graph["root"] = int(root) if root is not None else choose_root(G, coords)
     return G
