@@ -273,9 +273,10 @@ def evaluate_samples(args, gen_mols: list[GeometricMol], save_dir: Path) -> None
     gt_mols = [gt_dataset[i] for i in range(len(gt_dataset))]
     print(f"[eval] generated={len(gen_mols)} vs ground-truth({args.dataset_split})={len(gt_mols)}")
 
-    # Generated coords are standardised (./std); unscale to physical microns to match GT.
-    coord_std = util.NEURON_COORDS_STD_DEV
-    gen_graphs = [geometric_mol_to_nx(m, coord_scale=coord_std) for m in gen_mols]
+    # Both sets are already in physical units: the model rescales its output by
+    # coord_scale (= NEURON_COORDS_STD_DEV) inside _generate (see fm.py), and GT is
+    # loaded untransformed. So no extra scaling here -- coord_scale=1.0 for both.
+    gen_graphs = [geometric_mol_to_nx(m, coord_scale=1.0) for m in gen_mols]
     gt_graphs = [geometric_mol_to_nx(m, coord_scale=1.0) for m in gt_mols]
 
     import networkx as nx
