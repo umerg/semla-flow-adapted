@@ -4,6 +4,7 @@
 datasets/
 wandb/
 output/
+outputs/
 
 # Editors
 .vscode/
@@ -27,3 +28,5 @@ nohup.out
 # Slurm submission scripts and logs
 subslurm/
 slurm-*
+
+gmon.out

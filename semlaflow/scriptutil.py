@@ -30,6 +30,7 @@ GEOM_DRUGS_BUCKET_LIMITS = [24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 72, 96, 
 # Bucket limits cover the observed size distribution (p5=18, median=46,
 # p95=108, max=258). Train max observed: 217.
 NEURON_COORDS_STD_DEV = 62.6894
+# NEURON_COORDS_STD_DEV = 0.0727
 NEURON_BUCKET_LIMITS = [24, 40, 56, 72, 96, 128, 160, 200, 220]
 
 PROJECT_PREFIX = "equinv"
