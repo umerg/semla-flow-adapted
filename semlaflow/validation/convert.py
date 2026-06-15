@@ -20,6 +20,58 @@ from typing import Optional
 
 import networkx as nx
 import numpy as np
+import torch
+
+from semlaflow.util.molrepr import GeometricMol
+
+
+def samples_to_mols(output, edge_class_index: int) -> list[GeometricMol]:
+    """Extract a list of GeometricMol from a raw `_generate` (or `data`) batch dict.
+
+    Skips the RDKit-based builder entirely. For each batch element:
+      * crop to real nodes via the mask,
+      * argmax over bond distributions (works on one-hot `data` tensors too),
+      * symmetrise (edge iff either direction's argmax equals edge_class),
+      * emit one GeometricMol with degenerate atomics and zero charges.
+    """
+    coords = output["coords"].detach().cpu()
+    atomics = output["atomics"].detach().cpu()
+    bond_dists = output["bonds"].detach().cpu()
+    masks = output["mask"].detach().cpu().bool()
+
+    bond_argmax = bond_dists.argmax(dim=-1)
+
+    mols: list[GeometricMol] = []
+    for b in range(coords.size(0)):
+        n_real = int(masks[b].sum().item())
+        if n_real == 0:
+            continue
+
+        coords_b = coords[b, :n_real].float()
+        atomics_b = atomics[b, :n_real].argmax(-1).long()
+        pair = bond_argmax[b, :n_real, :n_real]
+
+        edge = (pair == edge_class_index) | (pair.T == edge_class_index)
+        iu = torch.triu_indices(n_real, n_real, offset=1)
+        if iu.size(1) == 0:
+            bond_indices = torch.zeros((0, 2), dtype=torch.long)
+        else:
+            keep = edge[iu[0], iu[1]]
+            bond_indices = iu[:, keep].T.long()
+
+        bond_types = torch.full((bond_indices.size(0),), edge_class_index, dtype=torch.long)
+        charges = torch.zeros((n_real,), dtype=torch.long)
+
+        mols.append(
+            GeometricMol(
+                coords=coords_b,
+                atomics=atomics_b,
+                bond_indices=bond_indices,
+                bond_types=bond_types,
+                charges=charges,
+            )
+        )
+    return mols
 
 
 def _coords_array(mol, coord_scale: float = 1.0) -> np.ndarray:

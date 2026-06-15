@@ -184,6 +184,10 @@ def build_model(args, dm, vocab):
     )
 
     cfm_cls = NeuronCFM if args.dataset == "neurons" else MolecularCFM
+    # NeuronCFM-only: toggle the generation-based structural validation metrics.
+    extra_cfm_kwargs = {}
+    if args.dataset == "neurons":
+        extra_cfm_kwargs["val_structural_metrics"] = args.val_structural_metrics
     fm_model = cfm_cls(
         egnn_gen,
         vocab,
@@ -206,6 +210,7 @@ def build_model(args, dm, vocab):
         train_smiles=train_smiles,
         type_mask_index=type_mask_index,
         bond_mask_index=bond_mask_index,
+        **extra_cfm_kwargs,
         **hparams,
     )
     return fm_model
@@ -353,14 +358,32 @@ def build_trainer(args):
     logger = WandbLogger(project=project_name, save_dir="wandb", log_model=True)
     lr_monitor = LearningRateMonitor(logging_interval="step")
     if args.dataset == "neurons":
-        # Neurons don't have RDKit validity; use the loss instead.
-        checkpointing = ModelCheckpoint(
-            every_n_epochs=val_check_epochs, monitor="val-loss", mode="min", save_last=True
+        # Neurons don't have RDKit validity; select the best checkpoint by loss.
+        best_ckpt = ModelCheckpoint(
+            every_n_epochs=val_check_epochs,
+            monitor="val-loss",
+            mode="min",
+            save_top_k=1,
+            save_last=True,
+            filename="best-{epoch:03d}-{val-loss:.4f}",
         )
+        # Periodic weights-only trajectory snapshots: keep all, so a better checkpoint can
+        # be picked post-hoc by inspecting the logged structural-metric trajectories.
+        # Weights-only (no optimizer/scheduler state) since these are for eval/sampling,
+        # not training resumption; the EMA weights used for sampling live in the state_dict.
+        periodic_ckpt = ModelCheckpoint(
+            every_n_epochs=val_check_epochs,
+            save_top_k=-1,
+            save_weights_only=True,
+            filename="snap-{epoch:03d}",
+        )
+        checkpointing = [best_ckpt, periodic_ckpt]
     else:
-        checkpointing = ModelCheckpoint(
-            every_n_epochs=val_check_epochs, monitor="val-validity", mode="max", save_last=True
-        )
+        checkpointing = [
+            ModelCheckpoint(
+                every_n_epochs=val_check_epochs, monitor="val-validity", mode="max", save_last=True
+            )
+        ]
 
     # No logger if doing a trial run
     logger = None if args.trial_run else logger
@@ -373,7 +396,7 @@ def build_trainer(args):
         accumulate_grad_batches=args.acc_batches,
         gradient_clip_val=args.gradient_clip_val,
         check_val_every_n_epoch=val_check_epochs,
-        callbacks=[lr_monitor, checkpointing],
+        callbacks=[lr_monitor, *checkpointing],
         precision="32",
     )
     return trainer
@@ -410,7 +433,7 @@ def main(args):
     print("Training complete.")
 
 
-if __name__ == "__main__":
+def get_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
     # Setup args
@@ -451,6 +474,11 @@ if __name__ == "__main__":
     parser.add_argument("--bucket_cost_scale", type=str, default=DEFAULT_BUCKET_COST_SCALE)
     parser.add_argument("--no_ema", action="store_false", dest="use_ema")
     parser.add_argument("--self_condition", action="store_true")
+    # Neurons only: disable the generation-based structural validation metrics (skips a
+    # full ODE rollout over the val set each validation -- faster, but loses the trajectory).
+    parser.add_argument(
+        "--no_val_structural_metrics", action="store_false", dest="val_structural_metrics"
+    )
     # parser.add_argument("--mixed_precision", action="store_true")
     # parser.add_argument("--compile_model", action="store_true")
     # parser.add_argument("--distill", action="store_true")
@@ -470,10 +498,15 @@ if __name__ == "__main__":
         trial_run=False,
         use_ema=True,
         self_condition=True,
+        val_structural_metrics=True,
         # compile_model=False,
         # mixed_precision=False,
         # distill=False
     )
 
-    args = parser.parse_args()
+    return parser
+
+
+if __name__ == "__main__":
+    args = get_parser().parse_args()
     main(args)
