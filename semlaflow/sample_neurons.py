@@ -92,6 +92,8 @@ def load_model(args, vocab):
         max_atoms=hparams["max_atoms"],
         tmd_dim=hparams.get("tmd_dim", 0),
         tmd_hidden=hparams.get("tmd_hidden", 0),
+        n_classes=hparams.get("n_classes", 0),
+        class_hidden=hparams.get("class_hidden", 0),
     )
 
     type_mask_index = (
@@ -125,8 +127,13 @@ def load_model(args, vocab):
 
 
 def build_dm(args, hparams, vocab):
-    coord_std = util.NEURON_COORDS_STD_DEV
-    bucket_limits = util.NEURON_BUCKET_LIMITS
+    # Match the coord scale / buckets the checkpoint was trained with (conditional corpus differs).
+    if hparams.get("dataset") == "neurons_conditional":
+        coord_std = util.NEURON_CONDITIONAL_COORDS_STD_DEV
+        bucket_limits = util.NEURON_CONDITIONAL_BUCKET_LIMITS
+    else:
+        coord_std = util.NEURON_COORDS_STD_DEV
+        bucket_limits = util.NEURON_BUCKET_LIMITS
 
     n_bond_types = util.get_n_bond_types(hparams["integration-type-strategy"])
     transform = partial(
@@ -202,10 +209,59 @@ def _split_path(data_path: str, split: str) -> Path:
     return Path(data_path) / fname
 
 
-def evaluate_samples(args, gen_mols: list[GeometricMol], save_dir: Path) -> None:
+def _add_per_class_metrics(metrics, gen_graphs, gen_classes, gt_graphs, gt_mols,
+                           compute_distribution_metrics, metric_keys, min_count) -> None:
+    """Populate metrics[f"class_<name>"] with per-class distribution metrics + print a table.
+
+    Generated graphs are grouped by their conditioning class (`gen_classes`), GT graphs by each
+    mol's own `_cell_class`. Classes with fewer than `min_count` graphs on either side are skipped.
+    """
+    import math
+
+    if len(gen_classes) != len(gen_graphs):
+        print(f"[eval] warning: gen_classes ({len(gen_classes)}) != gen_graphs "
+              f"({len(gen_graphs)}); skipping per-class metrics.")
+        return
+
+    gt_classes = [
+        int(m._cell_class) if getattr(m, "_cell_class", None) is not None else None
+        for m in gt_mols
+    ]
+    classes = sorted({c for c in gen_classes if c is not None})
+
+    print(f"\n[eval] per-cell-class metrics (Wasserstein-1; min_count={min_count})")
+    print(f"{'Class':<10}{'n_gen':>7}{'n_gt':>7}{'w1_mean':>10}")
+    print("-" * 34)
+    for c in classes:
+        cname = (
+            util.NEURON_CELL_CLASS_NAMES[c]
+            if 0 <= c < len(util.NEURON_CELL_CLASS_NAMES) else f"id{c}"
+        )
+        gen_c = [g for g, gc in zip(gen_graphs, gen_classes) if gc == c]
+        gt_c = [g for g, gc in zip(gt_graphs, gt_classes) if gc == c]
+        if len(gen_c) < min_count or len(gt_c) < min_count:
+            print(f"{cname:<10}{len(gen_c):>7}{len(gt_c):>7}{'(skip)':>10}")
+            continue
+        m_c = compute_distribution_metrics(gen_c, gt_c)
+        m_c["n_generated"] = float(len(gen_c))
+        m_c["n_ground_truth"] = float(len(gt_c))
+        metrics[f"class_{cname}"] = m_c
+        w1s = [m_c[k] for k in metric_keys if k in m_c and math.isfinite(m_c[k])]
+        mean_w1 = sum(w1s) / len(w1s) if w1s else float("nan")
+        print(f"{cname:<10}{len(gen_c):>7}{len(gt_c):>7}{mean_w1:>10.4f}")
+    print()
+
+
+def evaluate_samples(args, gen_mols: list[GeometricMol], save_dir: Path,
+                     gen_classes: list[int] | None = None) -> None:
     """Compare generated graphs against the ground-truth split: distribution metrics
     (Wasserstein-1 per structural stat) written to metrics.json + printed, and
     multi-azimuth plot grids of generated and GT samples saved as PNGs.
+
+    When `gen_classes` is given (type-conditioned runs), also computes per-neuron-type
+    stratified metrics: generated graphs are grouped by their conditioning class, GT graphs
+    by their own `_cell_class` label, and each class is scored distribution-vs-distribution
+    (curated subset = the same METRIC_KEYS), stored under `metrics["class_<name>"]`.
 
     Imports are local so the pure sampling path (and `--skip_eval`) pulls in no
     networkx/matplotlib.
@@ -249,6 +305,14 @@ def evaluate_samples(args, gen_mols: list[GeometricMol], save_dir: Path) -> None
     metrics["generated_disconnected_frac"] = gen_disc
     metrics["n_generated"] = float(len(gen_graphs))
     metrics["n_ground_truth"] = float(len(gt_graphs))
+
+    # Per-neuron-type stratified metrics (type-conditioned runs only): group generated graphs by
+    # their conditioning class and GT graphs by their own label, then score each class separately.
+    if gen_classes is not None:
+        _add_per_class_metrics(
+            metrics, gen_graphs, gen_classes, gt_graphs, gt_mols,
+            compute_distribution_metrics, METRIC_KEYS, args.per_cell_class_min_count,
+        )
 
     metrics_path = save_dir / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2))
@@ -317,6 +381,26 @@ def main(args):
             )
         print("TMD conditioning ON: conditioning on paired val-graph TMD vectors.")
 
+    # Cell-class (neuron type) conditioning guards: keep ckpt and CLI flag consistent.
+    ckpt_class_conditional = getattr(model.gen, "class_hidden", 0) > 0
+    if ckpt_class_conditional and not args.type_cond:
+        raise SystemExit(
+            "This checkpoint was trained with cell-class conditioning (class_hidden > 0). "
+            "Pass --type_cond to condition generation on the paired val graphs' classes."
+        )
+    if args.type_cond and not ckpt_class_conditional:
+        raise SystemExit(
+            "--type_cond was set but this checkpoint has no cell-class conditioning (class_hidden = 0)."
+        )
+    if args.type_cond:
+        sample_mol = dm.test_dataset[0]
+        if getattr(sample_mol, "_cell_class", None) is None:
+            raise SystemExit(
+                "--type_cond requires cell_class labels in the dataset, but none were found. "
+                "Preprocess a class-labelled corpus (SWCs with a `# cell_class N` header)."
+            )
+        print("Cell-class conditioning ON: conditioning on paired val-graph classes.")
+
     device = _device()
     model.eval().to(device)
     print(f"Model on {device}. Running generation...")
@@ -326,12 +410,20 @@ def main(args):
 
     test_dl = dm.test_dataloader()
     all_mols: list[GeometricMol] = []
+    gen_classes: list[int] = []  # conditioning class per emitted sample (type-conditioned runs)
     raw_batches: list[dict] = []
     for batch in tqdm(test_dl):
         prior = {k: v.to(device) for k, v in batch[0].items()}
         with torch.no_grad():
             output = model._generate(prior, args.integration_steps, args.ode_sampling_strategy)
-        all_mols.extend(samples_to_mols(output, edge_class_index=NEURON_EDGE_CLASS_INDEX))
+        batch_mols = samples_to_mols(output, edge_class_index=NEURON_EDGE_CLASS_INDEX)
+        all_mols.extend(batch_mols)
+        if args.type_cond and "cell_class" in prior:
+            # samples_to_mols drops all-masked (empty) graphs; align the class labels the same way
+            # so gen_classes stays 1:1 with all_mols. Each sample's class == the paired prior's class.
+            masks = output["mask"].detach().cpu().bool()
+            cc = prior["cell_class"].detach().cpu().reshape(-1).tolist()
+            gen_classes.extend(int(cc[b]) for b in range(masks.size(0)) if int(masks[b].sum()) > 0)
         if args.save_raw:
             raw_batches.append({k: v.detach().cpu() for k, v in output.items()})
 
@@ -353,7 +445,7 @@ def main(args):
 
     if not args.skip_eval:
         print("Evaluating samples (structural metrics + plots)...")
-        evaluate_samples(args, all_mols, save_dir)
+        evaluate_samples(args, all_mols, save_dir, gen_classes=gen_classes if args.type_cond else None)
 
     print("Done.")
 
@@ -380,10 +472,17 @@ if __name__ == "__main__":
                         help="Paired conditional generation: condition each sample on the real "
                              "val graph's TMD vector. Requires a TMD-trained checkpoint and a "
                              ".smol built with --compute_tmd.")
+    parser.add_argument("--type_cond", action="store_true",
+                        help="Paired conditional generation: condition each sample on the real "
+                             "val graph's cell-class label. Requires a class-conditioned checkpoint "
+                             "and a class-labelled .smol. Enables per-class stratified metrics.")
     parser.add_argument("--skip_eval", action="store_true",
                         help="Skip post-sampling structural metrics + plots (pure sampling only).")
     parser.add_argument("--n_plot_examples", type=int, default=DEFAULT_N_PLOT_EXAMPLES,
                         help="Number of generated/GT samples per multi-azimuth plot grid.")
+    parser.add_argument("--per_cell_class_min_count", type=int, default=20,
+                        help="Per-class stratified metrics (with --type_cond): skip classes with "
+                             "fewer than this many generated or GT graphs.")
 
     args = parser.parse_args()
     main(args)

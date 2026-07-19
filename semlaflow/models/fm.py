@@ -516,6 +516,7 @@ class MolecularCFM(L.LightningModule):
         bonds = batch["bonds"]
         mask = batch["mask"]
         cond_tmd = batch.get("tmd")  # per-graph conditioning vector; None when unused
+        cond_class = batch.get("cell_class")  # per-graph discrete class label; None when unused
 
         # Prepare invariant atom features
         times = t.view(-1, 1, 1).expand(-1, coords.size(1), -1)
@@ -537,10 +538,13 @@ class MolecularCFM(L.LightningModule):
                 cond_bonds=cond_batch["bonds"],
                 atom_mask=mask,
                 cond_tmd=cond_tmd,
+                cond_class=cond_class,
             )
 
         else:
-            out = model(coords, features, edge_feats=bonds, atom_mask=mask, cond_tmd=cond_tmd)
+            out = model(
+                coords, features, edge_feats=bonds, atom_mask=mask, cond_tmd=cond_tmd, cond_class=cond_class
+            )
 
         return out
 
@@ -907,6 +911,12 @@ class MolecularCFM(L.LightningModule):
                 }
 
                 curr = self.integrator.step(curr, predicted, prior, times, step_size)
+                # The integrator step rebuilds curr from coords/atomics/bonds/mask only, dropping any
+                # per-graph conditioning keys. Re-attach them from the prior so conditioning survives
+                # every ODE step (not just the first).
+                for cond_key in ("tmd", "cell_class"):
+                    if cond_key in prior:
+                        curr[cond_key] = prior[cond_key]
                 times = times + step_size
 
         predicted["coords"] = predicted["coords"] * self.coord_scale

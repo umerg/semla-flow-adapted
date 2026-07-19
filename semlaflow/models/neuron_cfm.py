@@ -31,16 +31,21 @@ class NeuronCFM(MolecularCFM):
     graphs are scored against the ground-truth val graphs with geometry-only W1 metrics.
     """
 
-    def __init__(self, *args, val_structural_metrics: bool = True, **kwargs):
+    def __init__(self, *args, val_structural_metrics: bool = True,
+                 per_cell_class: bool = True, per_cell_class_min_count: int = 20, **kwargs):
         # Force-disable molecular post-processing paths.
         kwargs["pairwise_metrics"] = False
         kwargs["train_smiles"] = None
-        # Persist the toggle in hparams (saved via **kwargs in the base class) so a
+        # Persist the toggles in hparams (saved via **kwargs in the base class) so a
         # reloaded checkpoint reconstructs with the same setting.
         kwargs["val_structural_metrics"] = val_structural_metrics
+        kwargs["per_cell_class"] = per_cell_class
+        kwargs["per_cell_class_min_count"] = per_cell_class_min_count
         super().__init__(*args, **kwargs)
 
         self.val_structural_metrics = val_structural_metrics
+        self.per_cell_class = per_cell_class
+        self.per_cell_class_min_count = per_cell_class_min_count
 
         # Replace the RDKit-driven metric collections with empty ones so any
         # stray .update() calls in base-class code are no-ops.
@@ -51,6 +56,9 @@ class NeuronCFM(MolecularCFM):
         # see on_validation_epoch_end for the single-GPU vs DDP note).
         self._val_gen_graphs = []
         self._val_gt_graphs = []
+        # Parallel per-graph class labels (populated only for a class-conditioned run).
+        self._val_gen_classes = []
+        self._val_gt_classes = []
 
     def validation_step(self, batch, b_idx):
         prior, data, interpolated, times = batch
@@ -108,16 +116,26 @@ class NeuronCFM(MolecularCFM):
         gen_mols = samples_to_mols(gen, NEURON_EDGE_CLASS_INDEX)
         gt_mols = samples_to_mols(data, NEURON_EDGE_CLASS_INDEX)
 
-        self._val_gen_graphs.extend(
-            geometric_mol_to_nx(m, coord_scale=1.0) for m in gen_mols
-        )
-        self._val_gt_graphs.extend(
-            geometric_mol_to_nx(m, coord_scale=self.coord_scale) for m in gt_mols
-        )
+        gen_graphs = [geometric_mol_to_nx(m, coord_scale=1.0) for m in gen_mols]
+        gt_graphs = [geometric_mol_to_nx(m, coord_scale=self.coord_scale) for m in gt_mols]
+        self._val_gen_graphs.extend(gen_graphs)
+        self._val_gt_graphs.extend(gt_graphs)
+
+        # Stash class labels for per-cell-class stratification. Each generated graph's class is the
+        # paired GT graph's class (gen is conditioned on it), so both lists get the same labels.
+        # samples_to_mols drops all-masked graphs; align labels to the graphs actually built.
+        if self.per_cell_class and self.gen.class_hidden > 0 and data.get("cell_class") is not None:
+            masks = data["mask"].detach().cpu().bool()
+            labels = data["cell_class"].detach().cpu().reshape(-1).tolist()
+            kept = [int(labels[b]) for b in range(masks.size(0)) if int(masks[b].sum()) > 0]
+            self._val_gen_classes.extend(kept)
+            self._val_gt_classes.extend(kept)
 
     def on_validation_epoch_start(self):
         self._val_gen_graphs = []
         self._val_gt_graphs = []
+        self._val_gen_classes = []
+        self._val_gt_classes = []
 
     def on_validation_epoch_end(self):
         if not self.val_structural_metrics:
@@ -156,5 +174,42 @@ class NeuronCFM(MolecularCFM):
         disc_frac = n_disc / len(self._val_gen_graphs)
         self.log("val-disconnected-frac", disc_frac, on_epoch=True, logger=True, sync_dist=True)
 
+        # Per-neuron-type stratified metrics (class-conditioned runs only). Group the accumulated
+        # gen/GT graphs by class label and score each subset separately; logged as
+        # val-class_<name>-<key> (monitoring only, not used for checkpoint selection).
+        if (
+            self.per_cell_class
+            and self._val_gen_classes
+            and len(self._val_gen_classes) == len(self._val_gen_graphs)
+            and len(self._val_gt_classes) == len(self._val_gt_graphs)
+        ):
+            from semlaflow.scriptutil import NEURON_CELL_CLASS_NAMES
+
+            classes = sorted({c for c in self._val_gen_classes})
+            for c in classes:
+                cname = (
+                    NEURON_CELL_CLASS_NAMES[c]
+                    if 0 <= c < len(NEURON_CELL_CLASS_NAMES) else f"id{c}"
+                )
+                gen_c = [g for g, gc in zip(self._val_gen_graphs, self._val_gen_classes) if gc == c]
+                gt_c = [g for g, gc in zip(self._val_gt_graphs, self._val_gt_classes) if gc == c]
+                if len(gen_c) < self.per_cell_class_min_count or len(gt_c) < self.per_cell_class_min_count:
+                    continue
+                m_c = compute_distribution_metrics(gen_c, gt_c)
+                finite_c = []
+                for key in METRIC_KEYS:
+                    val = m_c.get(key)
+                    if val is not None and math.isfinite(val):
+                        self.log(f"val-class_{cname}-{key}", val, on_epoch=True, logger=True, sync_dist=True)
+                        finite_c.append(val)
+                if finite_c:
+                    self.log(
+                        f"val-class_{cname}-w1-mean",
+                        sum(finite_c) / len(finite_c),
+                        on_epoch=True, logger=True, sync_dist=True,
+                    )
+
         self._val_gen_graphs = []
         self._val_gt_graphs = []
+        self._val_gen_classes = []
+        self._val_gt_classes = []

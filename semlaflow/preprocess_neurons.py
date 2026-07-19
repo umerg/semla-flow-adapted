@@ -129,6 +129,21 @@ def main():
         tmd_dim = int(train_mols[0]._tmd.shape[0])
         print(f"== TMD vector dim: {tmd_dim} == (pass --tmd_conditioning to train.py to use it)\n")
 
+    # Cell-class label summary (class-labelled corpora only): confirms every graph carries a
+    # `# cell_class N` header and shows the class balance before training with --type_conditioning.
+    n_labelled = sum(1 for m in train_mols if m._cell_class is not None)
+    if n_labelled:
+        from collections import Counter
+
+        class_hist = Counter(int(m._cell_class) for m in train_mols if m._cell_class is not None)
+        print(f"== Cell-class labels: {n_labelled}/{len(train_mols)} train graphs labelled ==")
+        for cls in sorted(class_hist):
+            print(f"   class {cls}: {class_hist[cls]}")
+        if n_labelled != len(train_mols):
+            print("   WARNING: some graphs are missing a `# cell_class` header "
+                  "(--type_conditioning requires all of them labelled).")
+        print("   (pass --type_conditioning to train.py to condition on these)\n")
+
     coord_std = _coord_std(train_mols)
     size_hist = np.bincount([m.seq_length for m in train_mols])
     print("\n== Measured neuron coord_std (over train, post zero-CoM): "

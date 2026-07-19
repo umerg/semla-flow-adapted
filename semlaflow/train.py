@@ -83,6 +83,22 @@ def build_model(args, dm, vocab):
         tmd_hidden = args.tmd_hidden
         print(f"TMD conditioning enabled: tmd_dim={tmd_dim}, tmd_hidden={tmd_hidden}")
 
+    # Cell-class (neuron type) conditioning: a discrete per-graph label embedded like the actual
+    # method (one_hot -> Linear). Orthogonal to TMD; both can be on at once.
+    n_classes = 0
+    class_hidden = 0
+    if getattr(args, "type_conditioning", False):
+        sample_mol = dm.train_dataset[0]
+        if getattr(sample_mol, "_cell_class", None) is None:
+            raise ValueError(
+                "--type_conditioning was set but the training data has no cell_class labels. "
+                "Preprocess a class-labelled corpus (SWCs with a `# cell_class N` header, "
+                "e.g. neurons_conditional)."
+            )
+        n_classes = util.NEURON_NUM_CLASSES
+        class_hidden = args.class_hidden
+        print(f"Class conditioning enabled: n_classes={n_classes}, class_hidden={class_hidden}")
+
     if args.arch == "semla":
         dynamics = EquiInvDynamics(
             args.d_model,
@@ -108,6 +124,8 @@ def build_model(args, dm, vocab):
             max_atoms=args.max_atoms,
             tmd_dim=tmd_dim,
             tmd_hidden=tmd_hidden,
+            n_classes=n_classes,
+            class_hidden=class_hidden,
         )
 
     elif args.arch == "eqgat":
@@ -139,6 +157,8 @@ def build_model(args, dm, vocab):
         coord_scale = util.GEOM_COORDS_STD_DEV
     elif args.dataset == "neurons":
         coord_scale = util.NEURON_COORDS_STD_DEV
+    elif args.dataset == "neurons_conditional":
+        coord_scale = util.NEURON_CONDITIONAL_COORDS_STD_DEV
     else:
         raise ValueError(f"Unknown dataset {args.dataset}")
 
@@ -167,7 +187,7 @@ def build_model(args, dm, vocab):
 
     train_steps = util.calc_train_steps(dm, args.epochs, args.acc_batches)
     # Neurons have no SMILES — skip the RDKit novelty path entirely.
-    if args.trial_run or args.dataset == "neurons":
+    if args.trial_run or args.dataset in util.NEURON_DATASETS:
         train_smiles = None
     else:
         train_smiles = [mols.str_id for mols in dm.train_dataset]
@@ -183,11 +203,13 @@ def build_model(args, dm, vocab):
         bond_mask_index=bond_mask_index,
     )
 
-    cfm_cls = NeuronCFM if args.dataset == "neurons" else MolecularCFM
+    cfm_cls = NeuronCFM if args.dataset in util.NEURON_DATASETS else MolecularCFM
     # NeuronCFM-only: toggle the generation-based structural validation metrics.
     extra_cfm_kwargs = {}
-    if args.dataset == "neurons":
+    if args.dataset in util.NEURON_DATASETS:
         extra_cfm_kwargs["val_structural_metrics"] = args.val_structural_metrics
+        extra_cfm_kwargs["per_cell_class"] = args.per_cell_class
+        extra_cfm_kwargs["per_cell_class_min_count"] = args.per_cell_class_min_count
     fm_model = cfm_cls(
         egnn_gen,
         vocab,
@@ -229,15 +251,20 @@ def build_dm(args, vocab):
         coord_std = util.NEURON_COORDS_STD_DEV
         padded_sizes = util.NEURON_BUCKET_LIMITS
 
+    elif args.dataset == "neurons_conditional":
+        coord_std = util.NEURON_CONDITIONAL_COORDS_STD_DEV
+        padded_sizes = util.NEURON_CONDITIONAL_BUCKET_LIMITS
+
     else:
         raise ValueError(
-            f"Unknown dataset {args.dataset}. Available: `qm9`, `geom-drugs`, `neurons`."
+            f"Unknown dataset {args.dataset}. Available: `qm9`, `geom-drugs`, `neurons`, "
+            "`neurons_conditional`."
         )
 
     data_path = Path(args.data_path)
 
     n_bond_types = util.get_n_bond_types(args.categorical_strategy)
-    if args.dataset == "neurons":
+    if args.dataset in util.NEURON_DATASETS:
         transform = partial(
             util.neuron_mol_transform, vocab=vocab, n_bonds=n_bond_types, coord_std=coord_std
         )
@@ -357,7 +384,7 @@ def build_trainer(args):
 
     logger = WandbLogger(project=project_name, save_dir="wandb", log_model=True)
     lr_monitor = LearningRateMonitor(logging_interval="step")
-    if args.dataset == "neurons":
+    if args.dataset in util.NEURON_DATASETS:
         # Neurons don't have RDKit validity; select the best checkpoint by loss.
         best_ckpt = ModelCheckpoint(
             every_n_epochs=val_check_epochs,
@@ -415,7 +442,7 @@ def main(args):
     util.configure_fs()
 
     print("Building model vocab...")
-    vocab = util.build_neuron_vocab() if args.dataset == "neurons" else util.build_vocab()
+    vocab = util.build_neuron_vocab() if args.dataset in util.NEURON_DATASETS else util.build_vocab()
     print(f"Vocab complete. Size={vocab.size}")
 
     print("Loading datamodule...")
@@ -458,6 +485,12 @@ def get_parser() -> argparse.ArgumentParser:
                              "preprocessed with --compute_tmd). Off => unconditional, unchanged.")
     parser.add_argument("--tmd_hidden", type=int, default=64,
                         help="Hidden/projection dim for the TMD conditioning MLP (when enabled).")
+    parser.add_argument("--type_conditioning", action="store_true",
+                        help="Condition generation on a per-graph neuron cell-class label (requires a "
+                             "class-labelled corpus, e.g. neurons_conditional). Off => unconditional. "
+                             "Orthogonal to --tmd_conditioning.")
+    parser.add_argument("--class_hidden", type=int, default=16,
+                        help="Embedding dim for the cell-class conditioning (one_hot -> Linear).")
 
     # Training args
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
@@ -479,6 +512,16 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no_val_structural_metrics", action="store_false", dest="val_structural_metrics"
     )
+    # Neurons only: per-cell-class stratified structural val metrics (only active for a
+    # class-conditioned run; harmless otherwise).
+    parser.add_argument(
+        "--no_per_cell_class", action="store_false", dest="per_cell_class",
+        help="Disable per-cell-class stratified structural validation metrics."
+    )
+    parser.add_argument(
+        "--per_cell_class_min_count", type=int, default=20,
+        help="Skip per-class metrics for classes with fewer than this many val graphs."
+    )
     # parser.add_argument("--mixed_precision", action="store_true")
     # parser.add_argument("--compile_model", action="store_true")
     # parser.add_argument("--distill", action="store_true")
@@ -499,6 +542,7 @@ def get_parser() -> argparse.ArgumentParser:
         use_ema=True,
         self_condition=True,
         val_structural_metrics=True,
+        per_cell_class=True,
         # compile_model=False,
         # mixed_precision=False,
         # distill=False

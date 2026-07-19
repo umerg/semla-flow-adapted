@@ -258,8 +258,13 @@ class VanillaEgnnGenerator(MolecularGenerator):
         cond_atomics=None,
         cond_bonds=None,
         atom_mask=None,
+        cond_tmd=None,
+        cond_class=None,
     ):
         """Predict molecular coordinates and atom types
+
+        Note: `cond_tmd`/`cond_class` are accepted for a uniform generator interface (fm.py passes
+        them unconditionally) but are unused here — TMD/class conditioning is a Semla-only feature.
 
         Args:
             coords (torch.Tensor): Input coordinates, shape [batch_size, num_atoms, 3]

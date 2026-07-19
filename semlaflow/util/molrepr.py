@@ -272,6 +272,7 @@ class GeometricMol(SmolMol):
         is_mmap: bool = False,
         str_id: Optional[str] = None,
         tmd: Optional[_T] = None,
+        cell_class: Optional[int] = None,
     ):
         # Check that each tensor has correct number of dimensions
         _check_shape_len(coords, 2, "coords")
@@ -309,6 +310,11 @@ class GeometricMol(SmolMol):
         # Optional per-graph conditioning vector (e.g. TMD). Carried through transforms,
         # batching, and (de)serialization untouched; None when unused.
         self._tmd = tmd
+        # Optional per-graph discrete class label (e.g. neuron cell class). Stored as a
+        # 0-dim int64 tensor (stacks cleanly to (B,) in collate); None when unused.
+        self._cell_class = (
+            None if cell_class is None else torch.as_tensor(cell_class, dtype=torch.long).reshape(())
+        )
 
         # If the data are not stored in mmap tensors, then convert to expected type and move to device
         if not is_mmap:
@@ -376,6 +382,13 @@ class GeometricMol(SmolMol):
             return None
         return torch.as_tensor(self._tmd).float()
 
+    @property
+    def cell_class(self) -> Optional[_T]:
+        """Optional per-graph discrete class label (0-dim int64 tensor), or None if unset."""
+        if self._cell_class is None:
+            return None
+        return torch.as_tensor(self._cell_class).long()
+
     # Note: this will always return a symmetric NxN matrix
     @property
     def adjacency(self) -> _T:
@@ -422,6 +435,7 @@ class GeometricMol(SmolMol):
             is_mmap=False,
             str_id=obj["id"],
             tmd=obj.get("tmd"),  # backward compatible: old .smol files have no TMD
+            cell_class=obj.get("cell_class"),  # backward compatible: old .smol files have no label
         )
         return mol
 
@@ -472,6 +486,7 @@ class GeometricMol(SmolMol):
             "device": str(self.device),
             "id": self._str_id,
             "tmd": None if self._tmd is None else torch.as_tensor(self._tmd).cpu(),
+            "cell_class": None if self._cell_class is None else torch.as_tensor(self._cell_class).cpu(),
         }
         byte_obj = pickle.dumps(dict_repr, protocol=PICKLE_PROTOCOL)
         return byte_obj
@@ -500,6 +515,7 @@ class GeometricMol(SmolMol):
         bond_types: Optional[_T] = None,
         charges: Optional[_T] = None,
         tmd: Optional[_T] = None,
+        cell_class: Optional[int] = None,
     ) -> GeometricMol:
 
         coords = self.coords if coords is None else coords
@@ -507,8 +523,9 @@ class GeometricMol(SmolMol):
         bond_indices = self.bond_indices if bond_indices is None else bond_indices
         bond_types = self.bond_types if bond_types is None else bond_types
         charges = self.charges if charges is None else charges
-        # Preserve the conditioning vector across transforms unless explicitly replaced.
+        # Preserve the conditioning fields across transforms unless explicitly replaced.
         tmd = self._tmd if tmd is None else tmd
+        cell_class = self._cell_class if cell_class is None else cell_class
 
         obj = GeometricMol(
             coords,
@@ -520,6 +537,7 @@ class GeometricMol(SmolMol):
             is_mmap=False,
             str_id=self._str_id,
             tmd=tmd,
+            cell_class=cell_class,
         )
         return obj
 

@@ -214,6 +214,12 @@ class GeometricDM(SmolDM):
         if real_mols and all(mol._tmd is not None for mol in real_mols):
             data["tmd"] = torch.stack([torch.as_tensor(mol._tmd) for mol in real_mols]).float()
 
+        # Per-graph discrete class label (e.g. neuron cell class) -> (B,) long tensor.
+        if real_mols and all(mol._cell_class is not None for mol in real_mols):
+            data["cell_class"] = torch.stack(
+                [torch.as_tensor(mol._cell_class) for mol in real_mols]
+            ).long()
+
         return data
 
     def _get_padded_size(self, smol_batch):

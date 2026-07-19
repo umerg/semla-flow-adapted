@@ -33,6 +33,23 @@ NEURON_COORDS_STD_DEV = 62.6894
 # NEURON_COORDS_STD_DEV = 0.0727
 NEURON_BUCKET_LIMITS = [24, 40, 56, 72, 96, 128, 160, 200, 220]
 
+# Class-labelled neuron corpus (/Users/umer/Documents/neurons_conditional): soma-rooted,
+# binarized, class-labelled SWCs. Same neuron vocab/transform/NeuronCFM as `neurons`, but a
+# separate corpus with its own coord scale.
+# Measured over the full train split (22740 graphs, post per-tree zero-CoM) by
+# preprocess_neurons.py; re-run and refresh if the corpus changes. Train node counts:
+# min=8, max=242 (10 graphs > 256 dropped) -> top bucket must cover 242.
+NEURON_CONDITIONAL_COORDS_STD_DEV = 66.0298
+NEURON_CONDITIONAL_BUCKET_LIMITS = [24, 40, 56, 72, 96, 128, 160, 200, 224, 256]
+
+# Cell-type (class) conditioning: single id<->name source of truth. Integer id == list index,
+# matching the `# cell_class N` SWC headers and dendrite_gen's utils.data_loading.CELL_CLASS_NAMES.
+NEURON_CELL_CLASS_NAMES = ["23P", "4P", "5P-IT", "5P-ET", "5P-NP", "6P-IT", "6P-CT"]
+NEURON_NUM_CLASSES = len(NEURON_CELL_CLASS_NAMES)
+
+# Datasets that use the neuron pipeline (vocab/transform/NeuronCFM/loss-based checkpointing).
+NEURON_DATASETS = ("neurons", "neurons_conditional")
+
 PROJECT_PREFIX = "equinv"
 BOND_MASK_INDEX = 5
 COMPILER_CACHE_SIZE = 128

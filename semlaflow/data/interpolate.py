@@ -237,6 +237,8 @@ class GeometricInterpolant(Interpolant):
         for from_mol, interp_mol, to_mol in zip(from_mols, interp_mols, to_mols):
             from_mol._tmd = to_mol._tmd
             interp_mol._tmd = to_mol._tmd
+            from_mol._cell_class = to_mol._cell_class
+            interp_mol._cell_class = to_mol._cell_class
 
         return from_mols, to_mols, interp_mols, list(times)
 

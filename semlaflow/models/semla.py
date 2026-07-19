@@ -711,6 +711,7 @@ class MolecularGenerator(ABC, torch.nn.Module):
         cond_bonds=None,
         atom_mask=None,
         cond_tmd=None,
+        cond_class=None,
     ):
         pass
 
@@ -729,6 +730,8 @@ class SemlaGenerator(MolecularGenerator):
         max_atoms=256,
         tmd_dim=0,
         tmd_hidden=0,
+        n_classes=0,
+        class_hidden=0,
     ):
 
         hparams = {
@@ -742,6 +745,8 @@ class SemlaGenerator(MolecularGenerator):
             "max_atoms": max_atoms,
             "tmd_dim": tmd_dim,
             "tmd_hidden": tmd_hidden,
+            "n_classes": n_classes,
+            "class_hidden": class_hidden,
             **dynamics.hparams,
         }
 
@@ -750,6 +755,8 @@ class SemlaGenerator(MolecularGenerator):
         self.self_cond = self_cond
         self.tmd_dim = tmd_dim
         self.tmd_hidden = tmd_hidden
+        self.n_classes = n_classes
+        self.class_hidden = class_hidden
 
         if d_edge is not None or n_edge_types is not None:
             if None in [d_edge, n_edge_types]:
@@ -779,6 +786,16 @@ class SemlaGenerator(MolecularGenerator):
             )
             in_feats = in_feats + tmd_hidden
 
+        # Optional discrete class conditioning (e.g. neuron cell type): one_hot(n_classes) -> Linear
+        # (a learned embedding, kept explicit), broadcast per-node and concatenated like the TMD slice.
+        # Disabled when class_hidden == 0.
+        self.class_proj = None
+        if class_hidden > 0:
+            if n_classes <= 0:
+                raise ValueError("n_classes must be > 0 when class_hidden > 0.")
+            self.class_proj = torch.nn.Linear(n_classes, class_hidden)
+            in_feats = in_feats + class_hidden
+
         self.size_emb = torch.nn.Embedding(max_atoms, size_emb)
         self.feat_proj = torch.nn.Sequential(
             torch.nn.Linear(in_feats, d_model), torch.nn.SiLU(inplace=False), torch.nn.Linear(d_model, d_model)
@@ -803,6 +820,7 @@ class SemlaGenerator(MolecularGenerator):
         cond_bonds=None,
         atom_mask=None,
         cond_tmd=None,
+        cond_class=None,
     ):
         """Predict molecular coordinates and atom types
 
@@ -854,6 +872,21 @@ class SemlaGenerator(MolecularGenerator):
             tmd_emb = self.tmd_proj(cond_tmd.float())
             tmd_emb = tmd_emb.unsqueeze(1).expand(-1, inv_feats.size(1), -1)
             inv_feats = torch.cat((inv_feats, tmd_emb), dim=-1)
+
+        # Embed the discrete class label and broadcast it to every node, exactly as the TMD slice.
+        # Required when the model was built with class conditioning (class_hidden > 0).
+        if self.class_proj is not None:
+            if cond_class is None:
+                raise ValueError(
+                    "Model was initialised with class conditioning (class_hidden > 0) but cond_class "
+                    "was not provided. Ensure the batch carries a 'cell_class' label."
+                )
+            onehot = torch.nn.functional.one_hot(
+                cond_class.long().reshape(-1), self.n_classes
+            ).to(dtype=inv_feats.dtype)
+            class_emb = self.class_proj(onehot)
+            class_emb = class_emb.unsqueeze(1).expand(-1, inv_feats.size(1), -1)
+            inv_feats = torch.cat((inv_feats, class_emb), dim=-1)
 
         if cond_atomics is not None:
             inv_feats = torch.cat((inv_feats, cond_atomics), dim=-1)
