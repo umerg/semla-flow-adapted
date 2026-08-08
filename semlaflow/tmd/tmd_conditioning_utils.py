@@ -111,6 +111,28 @@ def filtration_radial_rho(G: nx.Graph) -> Dict[int, float]:
     return out
 
 
+def filtration_radial_root(G: nx.Graph) -> Dict[int, float]:
+    """Filtration: straight-line (Euclidean) distance from the root position.
+
+    Unlike ``rho`` (distance from the z-axis) or ``height`` (z), this is the canonical
+    Kanari-style radial filtration anchored at the soma/root. It encodes branching
+    topology weighted by spatial reach and is fully rotation-invariant -- which is why it
+    is the evaluation filtration here: SEMLA is E(3)-equivariant, so the axis-dependent
+    filtrations are unusable for scoring generated graphs.
+
+    It is also deliberately *outside* SemlaFlow's conditioning set
+    (``NEURON_TMD_FILTRATIONS = ("path",)``), so ``mmd_tmd`` is independent evidence
+    rather than a measure of the model echoing its own conditioning input.
+    """
+    assert_rooted_tree_graph(G)
+    root = G.graph["root"]
+    root_pos = np.asarray(G.nodes[root]["pos"], dtype=np.float64)
+    return {
+        nid: float(np.linalg.norm(np.asarray(G.nodes[nid]["pos"], dtype=np.float64) - root_pos))
+        for nid in G.nodes
+    }
+
+
 def normalize_filtration_values(
     f: Dict[int, float],
     *,
@@ -345,7 +367,7 @@ def persistence_image(
 # High-level API for your workflow
 # -----------------------------
 
-FiltrationName = Literal["path", "height", "rho"]
+FiltrationName = Literal["path", "height", "rho", "radial_root"]
 
 
 def compute_tmd_global_embedding(

@@ -82,8 +82,46 @@ def _coords_array(mol, coord_scale: float = 1.0) -> np.ndarray:
     return coords
 
 
+# Fraction of the principal-axis range treated as an "end band" when canonicalising the axis
+# sign. Tuned over all three trees_genus corpora (0.05-0.50 swept); 0.15 is the plateau.
+_END_BAND_FRAC = 0.15
+
+
+def _orient_axis(centred: np.ndarray, axis: np.ndarray) -> np.ndarray:
+    """Point `axis` from the sparse end of the point cloud towards the dense end.
+
+    `np.linalg.eigh` returns eigenvectors of arbitrary sign. That is harmless for the extent
+    metrics (they use the axis sign-invariantly) but it decides which end `pca_base_root`
+    calls the "base", so without canonicalisation the root is one of the two ends at random.
+
+    A tree is sparse at the trunk base and dense in the crown, so we compare how many points
+    fall in the outer band at each end and orient towards the denser one. Ties (tiny or
+    near-symmetric graphs) fall back to which end has the longer tail past the median. Both
+    tests are rotation-invariant, which is required because the training transform applies a
+    random rotation.
+    """
+    proj = centred @ axis
+    lo, hi = float(proj.min()), float(proj.max())
+    span = hi - lo
+    if span <= 0.0:
+        return axis
+
+    band = span * _END_BAND_FRAC
+    n_lo = int((proj <= lo + band).sum())
+    n_hi = int((proj >= hi - band).sum())
+    if n_lo != n_hi:
+        # Denser end is the crown; the axis should point towards it.
+        return axis if n_hi > n_lo else -axis
+
+    median = float(np.median(proj))
+    return axis if (median - lo) > (hi - median) else -axis
+
+
 def pca_axis(coords: np.ndarray) -> np.ndarray:
     """Unit principal axis (top eigenvector of the centred coord covariance).
+
+    Oriented sparse-end -> dense-end by `_orient_axis` so that the sign is reproducible
+    across graphs; see that function for why it matters.
 
     Falls back to +z for degenerate inputs (<2 points or zero variance).
     """
@@ -99,7 +137,7 @@ def pca_axis(coords: np.ndarray) -> np.ndarray:
     norm = float(np.linalg.norm(axis))
     if norm < 1e-12:
         return np.array([0.0, 0.0, 1.0])
-    return axis / norm
+    return _orient_axis(centred, axis / norm)
 
 
 def pca_base_root(coords: np.ndarray) -> int:

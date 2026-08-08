@@ -1,12 +1,15 @@
-"""Convert cleaned SWC neuron files into SemlaFlow's .smol binary format.
+"""Convert cleaned SWC neuron/tree files into SemlaFlow's .smol binary format.
 
-Expects an input layout produced by dendrite_gen's prepare_neurons_final.py:
+Expects an input layout produced by dendrite_gen's prepare_neurons_final.py,
+prepare_conditional_dataset.py or prepare_tree_dataset.py:
 
     <input_dir>/train/*.swc
     <input_dir>/val_extended/*.swc   (preferred; fallback: <input_dir>/val)
+    <input_dir>/test/*.swc           (optional; skipped when absent)
 
-Writes <output_dir>/{train,val}.smol and prints a measured coord_std
-(over zero-CoM'd training coordinates) for NEURON_COORDS_STD_DEV.
+Writes <output_dir>/{train,val}.smol, plus test.smol when a test split exists, and prints a
+measured coord_std (over zero-CoM'd training coordinates) plus per-split max node counts.
+Paste those into the dataset's entry in semlaflow.scriptutil.DATASET_CONFIGS.
 """
 
 from __future__ import annotations
@@ -69,14 +72,14 @@ def main():
     parser.add_argument(
         "--input_dir",
         type=str,
-        default="/Users/umer/Documents/neurons_final",
+        required=True,
         help="Directory with train/ and val_extended/ (or val/) subfolders of SWC files.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/Users/umer/Documents/neurons_final/smol",
-        help="Where to write {train,val}.smol.",
+        required=True,
+        help="Where to write {train,val,test}.smol.",
     )
     parser.add_argument("--max_atoms", type=int, default=MAX_ATOMS)
     parser.add_argument(
@@ -84,6 +87,13 @@ def main():
         type=str,
         default=None,
         help="Subdir to use for validation. Auto-picks 'val_extended' if present, else 'val'.",
+    )
+    parser.add_argument(
+        "--test_dir_name",
+        type=str,
+        default=None,
+        help="Subdir to use for the test split. Auto-detects 'test' if present; no test.smol "
+             "is written when absent (the neuron corpora have no usable test split).",
     )
     parser.add_argument(
         "--compute_tmd",
@@ -111,6 +121,12 @@ def main():
     else:
         val_files = _list_swc(input_dir / "val_extended") or _list_swc(input_dir / "val")
 
+    # A missing test split is normal (the neuron corpora have none), so only an explicitly
+    # requested --test_dir_name that turns up empty is an error.
+    test_files = _list_swc(input_dir / (args.test_dir_name or "test"))
+    if args.test_dir_name and not test_files:
+        raise SystemExit(f"No test SWC files found under {input_dir / args.test_dir_name}")
+
     if not train_files:
         raise SystemExit(f"No train SWC files found under {input_dir}/train")
     if not val_files:
@@ -118,12 +134,18 @@ def main():
 
     print(f"train files: {len(train_files)}")
     print(f"val   files: {len(val_files)}")
+    print(f"test  files: {len(test_files) if test_files else 0}"
+          f"{'' if test_files else '  (no test split -- test.smol will not be written)'}")
 
     tmd_filtrations = tuple(args.tmd_filtrations)
     if args.compute_tmd:
         print(f"Computing TMD conditioning vectors (filtrations={tmd_filtrations})...")
     train_mols = _convert(train_files, args.max_atoms, "train", args.compute_tmd, tmd_filtrations)
     val_mols = _convert(val_files, args.max_atoms, "val", args.compute_tmd, tmd_filtrations)
+    test_mols = (
+        _convert(test_files, args.max_atoms, "test", args.compute_tmd, tmd_filtrations)
+        if test_files else None
+    )
 
     if args.compute_tmd and train_mols:
         tmd_dim = int(train_mols[0]._tmd.shape[0])
@@ -145,12 +167,21 @@ def main():
         print("   (pass --type_conditioning to train.py to condition on these)\n")
 
     coord_std = _coord_std(train_mols)
-    size_hist = np.bincount([m.seq_length for m in train_mols])
-    print("\n== Measured neuron coord_std (over train, post zero-CoM): "
-          f"{coord_std:.4f} ==")
-    print("Paste this into semlaflow.scriptutil as NEURON_COORDS_STD_DEV.\n")
-    print(f"train size: min={size_hist.nonzero()[0].min()}, "
-          f"max={len(size_hist) - 1}, total={len(train_mols)}")
+    print(f"\n== Measured coord_std (over train, post zero-CoM): {coord_std:.4f} ==")
+
+    # Bucket limits must cover the largest graph in *every* split, not just train --
+    # BucketBatchSampler raises for the val loader too. So report all of them.
+    splits = [("train", train_mols), ("val", val_mols)]
+    if test_mols is not None:
+        splits.append(("test", test_mols))
+    max_nodes = 0
+    for name, mols in splits:
+        sizes = [m.seq_length for m in mols]
+        max_nodes = max(max_nodes, max(sizes))
+        print(f"   {name:<5} size: min={min(sizes)}, max={max(sizes)}, total={len(mols)}")
+    print(f"\nPaste into semlaflow.scriptutil.DATASET_CONFIGS: coord_std={coord_std:.4f}, "
+          f"max_nodes={args.max_atoms}.")
+    print(f"Top bucket limit must be >= {max_nodes} (largest graph across all splits).\n")
 
     print("Serialising train.smol...")
     (output_dir / "train.smol").write_bytes(
@@ -160,6 +191,11 @@ def main():
     (output_dir / "val.smol").write_bytes(
         GeometricMolBatch.from_list(val_mols).to_bytes()
     )
+    if test_mols is not None:
+        print("Serialising test.smol...")
+        (output_dir / "test.smol").write_bytes(
+            GeometricMolBatch.from_list(test_mols).to_bytes()
+        )
 
     # Round-trip smoke check on the first train mol.
     round_tripped = GeometricMolBatch.from_bytes(
@@ -171,7 +207,10 @@ def main():
     assert torch.allclose(m0.coords, m0_orig.coords, atol=1e-5), "coord round-trip mismatch"
     assert m0.bond_indices.shape == m0_orig.bond_indices.shape, "bond_indices round-trip mismatch"
     print("Round-trip OK.\n")
-    print(f"Wrote:\n  {output_dir / 'train.smol'}\n  {output_dir / 'val.smol'}")
+    written = ["train.smol", "val.smol"] + (["test.smol"] if test_mols is not None else [])
+    print("Wrote:")
+    for name in written:
+        print(f"  {output_dir / name}")
 
 
 if __name__ == "__main__":

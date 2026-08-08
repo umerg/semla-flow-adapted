@@ -120,6 +120,9 @@ def load_model(args, vocab):
 
 
 def build_dm(args, hparams, vocab):
+    # Molecular datasets only -- this script computes chemistry metrics (validity/energy/
+    # stability) that have no analogue for the SWC (neuron/tree) corpora. Raising on those is
+    # the intended behaviour. Deliberately not wired to scriptutil.DATASET_CONFIGS.
     if args.dataset == "qm9":
         coord_std = util.QM9_COORDS_STD_DEV
         bucket_limits = util.QM9_BUCKET_LIMITS

@@ -26,6 +26,7 @@ from .tmd_conditioning_utils import (
     filtration_height_z,
     filtration_path_length_from_root,
     filtration_radial_rho,
+    filtration_radial_root,
     normalize_filtration_values,
     persistence_image,
 )
@@ -68,6 +69,8 @@ def compute_tmd_barcode_diagram(
         f_full = filtration_height_z(G)
     elif filtration == "rho":
         f_full = filtration_radial_rho(G)
+    elif filtration == "radial_root":
+        f_full = filtration_radial_root(G)
     else:
         raise ValueError(f"Unknown filtration name: {filtration!r}")
 
@@ -94,6 +97,7 @@ def _resolve_method_map(
         "path": "tmd",
         "height": "0d",
         "rho": "0d",
+        "radial_root": "tmd",
     }
 
     if method_by_filtration is None:
@@ -176,6 +180,8 @@ def compute_tmd_mixed(
             f_full = filtration_height_z(G)
         elif name == "rho":
             f_full = filtration_radial_rho(G)
+        elif name == "radial_root":
+            f_full = filtration_radial_root(G)
         else:
             raise ValueError(f"Unknown filtration name: {name!r}")
 

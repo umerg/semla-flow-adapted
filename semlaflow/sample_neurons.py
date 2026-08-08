@@ -19,6 +19,7 @@ import argparse
 import json
 from functools import partial
 from pathlib import Path
+from time import perf_counter
 
 import lightning as L
 import torch
@@ -126,31 +127,36 @@ def load_model(args, vocab):
     return fm_model
 
 
+def _split_path(data_path: str, split: str) -> Path:
+    fname = {"train": "train.smol", "val": "val.smol", "test": "test.smol"}.get(split)
+    if fname is None:
+        raise ValueError(f"Unknown dataset_split '{split}'")
+    return Path(data_path) / fname
+
+
+def resolve_dataset(args, hparams) -> str:
+    """The corpus this checkpoint was trained on -- drives coord scale, buckets and class names."""
+    dataset = args.dataset or hparams.get("dataset")
+    if dataset is None:
+        raise SystemExit(
+            "This checkpoint records no 'dataset' hyperparameter. Pass --dataset explicitly so "
+            "the correct coord scale, bucket limits and class names are used."
+        )
+    return dataset
+
+
 def build_dm(args, hparams, vocab):
-    # Match the coord scale / buckets the checkpoint was trained with (conditional corpus differs).
-    if hparams.get("dataset") == "neurons_conditional":
-        coord_std = util.NEURON_CONDITIONAL_COORDS_STD_DEV
-        bucket_limits = util.NEURON_CONDITIONAL_BUCKET_LIMITS
-    else:
-        coord_std = util.NEURON_COORDS_STD_DEV
-        bucket_limits = util.NEURON_BUCKET_LIMITS
+    # Match the coord scale / buckets the checkpoint was trained with; each corpus has its own.
+    cfg = util.get_dataset_config(resolve_dataset(args, hparams))
+    coord_std = cfg.coord_std
+    bucket_limits = cfg.bucket_limits
 
     n_bond_types = util.get_n_bond_types(hparams["integration-type-strategy"])
     transform = partial(
         util.neuron_mol_transform, vocab=vocab, n_bonds=n_bond_types, coord_std=coord_std
     )
 
-    data_dir = Path(args.data_path)
-    if args.dataset_split == "train":
-        dataset_path = data_dir / "train.smol"
-    elif args.dataset_split == "val":
-        dataset_path = data_dir / "val.smol"
-    elif args.dataset_split == "test":
-        dataset_path = data_dir / "test.smol"
-    else:
-        raise ValueError(f"Unknown dataset_split '{args.dataset_split}'")
-
-    dataset = GeometricDataset.load(dataset_path, transform=transform)
+    dataset = GeometricDataset.load(_split_path(args.data_path, args.dataset_split), transform=transform)
     dataset = dataset.sample(args.n_molecules, replacement=True)
 
     type_mask_index = (
@@ -199,25 +205,21 @@ def build_dm(args, hparams, vocab):
 def dm_from_ckpt(args, vocab):
     checkpoint = torch.load(args.ckpt_path, map_location="cpu")
     hparams = checkpoint["hyper_parameters"]
-    return build_dm(args, hparams, vocab)
-
-
-def _split_path(data_path: str, split: str) -> Path:
-    fname = {"train": "train.smol", "val": "val.smol", "test": "test.smol"}.get(split)
-    if fname is None:
-        raise ValueError(f"Unknown dataset_split '{split}'")
-    return Path(data_path) / fname
+    return build_dm(args, hparams, vocab), resolve_dataset(args, hparams)
 
 
 def _add_per_class_metrics(metrics, gen_graphs, gen_classes, gt_graphs, gt_mols,
-                           compute_distribution_metrics, metric_keys, min_count) -> None:
+                           compute_distribution_metrics, min_count,
+                           dataset=None, gt_cache=None, subset_fn=None) -> None:
     """Populate metrics[f"class_<name>"] with per-class distribution metrics + print a table.
 
     Generated graphs are grouped by their conditioning class (`gen_classes`), GT graphs by each
     mol's own `_cell_class`. Classes with fewer than `min_count` graphs on either side are skipped.
-    """
-    import math
 
+    `gt_cache` + `subset_fn` re-target the run-wide GT fit at each class's own GT graphs. The
+    reference set must be per-class, but the standardization, MMD bandwidths and TMD PCA must
+    stay run-wide or the classes are comparable neither to each other nor to the overall run.
+    """
     if len(gen_classes) != len(gen_graphs):
         print(f"[eval] warning: gen_classes ({len(gen_classes)}) != gen_graphs "
               f"({len(gen_graphs)}); skipping per-class metrics.")
@@ -229,31 +231,30 @@ def _add_per_class_metrics(metrics, gen_graphs, gen_classes, gt_graphs, gt_mols,
     ]
     classes = sorted({c for c in gen_classes if c is not None})
 
-    print(f"\n[eval] per-cell-class metrics (Wasserstein-1; min_count={min_count})")
-    print(f"{'Class':<10}{'n_gen':>7}{'n_gt':>7}{'w1_mean':>10}")
-    print("-" * 34)
+    print(f"\n[eval] per-cell-class metrics (min_count={min_count})")
+    print(f"{'Class':<10}{'n_gen':>7}{'n_gt':>7}{'mmd_morpho':>12}{'w1_pooled_n':>13}")
+    print("-" * 49)
     for c in classes:
-        cname = (
-            util.NEURON_CELL_CLASS_NAMES[c]
-            if 0 <= c < len(util.NEURON_CELL_CLASS_NAMES) else f"id{c}"
-        )
+        cname = util.class_label(dataset, c)
         gen_c = [g for g, gc in zip(gen_graphs, gen_classes) if gc == c]
         gt_c = [g for g, gc in zip(gt_graphs, gt_classes) if gc == c]
         if len(gen_c) < min_count or len(gt_c) < min_count:
-            print(f"{cname:<10}{len(gen_c):>7}{len(gt_c):>7}{'(skip)':>10}")
+            print(f"{cname:<10}{len(gen_c):>7}{len(gt_c):>7}{'(skip)':>12}{'':>13}")
             continue
-        m_c = compute_distribution_metrics(gen_c, gt_c)
+        cache_c = subset_fn(gt_cache, gt_c) if (gt_cache is not None and subset_fn) else None
+        m_c = compute_distribution_metrics(gen_c, gt_c, gt_cache=cache_c)
         m_c["n_generated"] = float(len(gen_c))
         m_c["n_ground_truth"] = float(len(gt_c))
         metrics[f"class_{cname}"] = m_c
-        w1s = [m_c[k] for k in metric_keys if k in m_c and math.isfinite(m_c[k])]
-        mean_w1 = sum(w1s) / len(w1s) if w1s else float("nan")
-        print(f"{cname:<10}{len(gen_c):>7}{len(gt_c):>7}{mean_w1:>10.4f}")
+        mmd = m_c.get("mmd_morpho", float("nan"))
+        pooled = m_c.get("w1_pooled_mean_normalized", float("nan"))
+        print(f"{cname:<10}{len(gen_c):>7}{len(gt_c):>7}{mmd:>12.5f}{pooled:>13.4f}")
     print()
 
 
 def evaluate_samples(args, gen_mols: list[GeometricMol], save_dir: Path,
-                     gen_classes: list[int] | None = None) -> None:
+                     gen_classes: list[int] | None = None,
+                     timing: dict | None = None, dataset: str | None = None) -> None:
     """Compare generated graphs against the ground-truth split: distribution metrics
     (Wasserstein-1 per structural stat) written to metrics.json + printed, and
     multi-azimuth plot grids of generated and GT samples saved as PNGs.
@@ -261,7 +262,7 @@ def evaluate_samples(args, gen_mols: list[GeometricMol], save_dir: Path,
     When `gen_classes` is given (type-conditioned runs), also computes per-neuron-type
     stratified metrics: generated graphs are grouped by their conditioning class, GT graphs
     by their own `_cell_class` label, and each class is scored distribution-vs-distribution
-    (curated subset = the same METRIC_KEYS), stored under `metrics["class_<name>"]`.
+    against that class's own GT, stored under `metrics["class_<name>"]`.
 
     Imports are local so the pure sampling path (and `--skip_eval`) pulls in no
     networkx/matplotlib.
@@ -269,7 +270,12 @@ def evaluate_samples(args, gen_mols: list[GeometricMol], save_dir: Path,
     import matplotlib.pyplot as plt
 
     from semlaflow.validation.convert import geometric_mol_to_nx
-    from semlaflow.validation.dist_metrics import METRIC_KEYS, compute_distribution_metrics
+    from semlaflow.validation.dist_metrics import (
+        build_gt_cache,
+        compute_distribution_metrics,
+        keys_for_level,
+        subset_gt_cache,
+    )
     from semlaflow.validation.plot import plot_graph_grid_angles
 
     gt_path = _split_path(args.data_path, args.dataset_split)
@@ -283,46 +289,49 @@ def evaluate_samples(args, gen_mols: list[GeometricMol], save_dir: Path,
     print(f"[eval] generated={len(gen_mols)} vs ground-truth({args.dataset_split})={len(gt_mols)}")
 
     # Both sets are already in physical units: the model rescales its output by
-    # coord_scale (= NEURON_COORDS_STD_DEV) inside _generate (see fm.py), and GT is
-    # loaded untransformed. So no extra scaling here -- coord_scale=1.0 for both.
+    # coord_scale (= the dataset's coord_std, see DATASET_CONFIGS) inside _generate (see fm.py),
+    # and GT is loaded untransformed. So no extra scaling here -- coord_scale=1.0 for both.
     gen_graphs = [geometric_mol_to_nx(m, coord_scale=1.0) for m in gen_mols]
     gt_graphs = [geometric_mol_to_nx(m, coord_scale=1.0) for m in gt_mols]
 
-    import networkx as nx
-
-    def _disconnected_frac(graphs):
-        if not graphs:
-            return 0.0
-        n_disc = sum(1 for g in graphs if g.number_of_nodes() > 0 and not nx.is_connected(g))
-        return n_disc / len(graphs)
-
-    gen_disc = _disconnected_frac(gen_graphs)
-    if gen_disc > 0:
-        print(f"[eval] note: {gen_disc:.1%} of generated graphs are disconnected "
-              "(root-based stats only cover the root's component).")
-
-    metrics = compute_distribution_metrics(gen_graphs, gt_graphs)
-    metrics["generated_disconnected_frac"] = gen_disc
+    # Same GT fit and same sanitisation as the in-loop path, so metrics.json lines up
+    # key-for-key with the `val-*` series.
+    gt_cache = build_gt_cache(gt_graphs)
+    metrics = compute_distribution_metrics(gen_graphs, gt_graphs, gt_cache=gt_cache)
     metrics["n_generated"] = float(len(gen_graphs))
     metrics["n_ground_truth"] = float(len(gt_graphs))
+
+    for key in ("disconnected_frac", "multifurcation_frac", "cycle_frac",
+                "isolated_node_frac", "non_critical_node_frac"):
+        val = metrics.get(key, 0.0)
+        if val and val > 0:
+            print(f"[eval] structural health: {key} = {val:.1%} "
+                  "(ground truth is exactly 0 for both corpora)")
 
     # Per-neuron-type stratified metrics (type-conditioned runs only): group generated graphs by
     # their conditioning class and GT graphs by their own label, then score each class separately.
     if gen_classes is not None:
         _add_per_class_metrics(
             metrics, gen_graphs, gen_classes, gt_graphs, gt_mols,
-            compute_distribution_metrics, METRIC_KEYS, args.per_cell_class_min_count,
+            compute_distribution_metrics, args.per_cell_class_min_count,
+            dataset=dataset, gt_cache=gt_cache, subset_fn=subset_gt_cache,
         )
+
+    if timing is not None:
+        metrics.update(timing)
 
     metrics_path = save_dir / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2))
     print(f"[eval] wrote metrics -> {metrics_path}")
 
-    print(f"\n[eval] distribution metrics (Wasserstein-1; lower is better)")
-    print(f"{'Metric':<26}Value")
-    print("-" * 38)
-    for key in METRIC_KEYS:
-        print(f"{key:<26}{metrics[key]:.4f}")
+    # `*_w1` and `mmd_*` are lower-is-better; `density_*`/`coverage_*` are higher-is-better;
+    # the health fractions are 0.0 on ground truth for both corpora.
+    print(f"\n[eval] distribution metrics (report level: {args.metric_report_level})")
+    print(f"{'Metric':<30}Value")
+    print("-" * 42)
+    for key in keys_for_level(args.metric_report_level):
+        if key in metrics:
+            print(f"{key:<30}{metrics[key]:.5f}")
     print()
 
     # Multi-azimuth plot grids: generated and GT references at the same angles.
@@ -356,7 +365,8 @@ def main(args):
     print(f"Vocab size: {vocab.size}")
 
     print("Loading datamodule (size-prior source)...")
-    dm = dm_from_ckpt(args, vocab)
+    dm, dataset = dm_from_ckpt(args, vocab)
+    print(f"Dataset: {dataset}")
 
     print("Loading model...")
     model = load_model(args, vocab)
@@ -412,10 +422,21 @@ def main(args):
     all_mols: list[GeometricMol] = []
     gen_classes: list[int] = []  # conditioning class per emitted sample (type-conditioned runs)
     raw_batches: list[dict] = []
+    sampling_seconds_total = 0.0  # wall-clock spent inside _generate (the ODE rollout only)
+    n_sampled = 0                 # graphs the ODE integrated (rows fed to _generate)
     for batch in tqdm(test_dl):
         prior = {k: v.to(device) for k, v in batch[0].items()}
+        # Time only the _generate rollout. CUDA kernels are async, so synchronise on both
+        # sides or we'd measure kernel-launch overhead rather than the actual sampling work.
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        _t0 = perf_counter()
         with torch.no_grad():
             output = model._generate(prior, args.integration_steps, args.ode_sampling_strategy)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        sampling_seconds_total += perf_counter() - _t0
+        n_sampled += prior["coords"].size(0)
         batch_mols = samples_to_mols(output, edge_class_index=NEURON_EDGE_CLASS_INDEX)
         all_mols.extend(batch_mols)
         if args.type_cond and "cell_class" in prior:
@@ -426,6 +447,19 @@ def main(args):
             gen_classes.extend(int(cc[b]) for b in range(masks.size(0)) if int(masks[b].sum()) > 0)
         if args.save_raw:
             raw_batches.append({k: v.detach().cpu() for k, v in output.items()})
+
+    sampling_seconds_per_sample = sampling_seconds_total / max(n_sampled, 1)
+    sampling_samples_per_sec = n_sampled / sampling_seconds_total if sampling_seconds_total > 0 else 0.0
+    timing = {
+        "sampling_seconds_total": sampling_seconds_total,
+        "sampling_seconds_per_sample": sampling_seconds_per_sample,
+        "sampling_samples_per_sec": sampling_samples_per_sec,
+        "n_sampled": n_sampled,
+    }
+    print(
+        f"[timing] sampled {n_sampled} graphs in {sampling_seconds_total:.2f}s "
+        f"({sampling_seconds_per_sample * 1e3:.1f} ms/sample, {sampling_samples_per_sec:.1f} samples/s)"
+    )
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -445,7 +479,9 @@ def main(args):
 
     if not args.skip_eval:
         print("Evaluating samples (structural metrics + plots)...")
-        evaluate_samples(args, all_mols, save_dir, gen_classes=gen_classes if args.type_cond else None)
+        evaluate_samples(args, all_mols, save_dir,
+                         gen_classes=gen_classes if args.type_cond else None, timing=timing,
+                         dataset=dataset)
 
     print("Done.")
 
@@ -457,6 +493,10 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir", type=str, required=True)
     parser.add_argument("--save_file", type=str, default=DEFAULT_SAVE_FILE)
 
+    parser.add_argument("--dataset", type=str, default=None,
+                        help="Override the dataset name recorded in the checkpoint. Selects the "
+                             "coord scale, bucket limits and class names from "
+                             "scriptutil.DATASET_CONFIGS. Normally inferred from the checkpoint.")
     parser.add_argument("--dataset_split", type=str, default=DEFAULT_DATASET_SPLIT)
     parser.add_argument("--n_molecules", type=int, default=DEFAULT_N_MOLECULES)
     parser.add_argument("--batch_cost", type=int, default=DEFAULT_BATCH_COST)
@@ -483,6 +523,10 @@ if __name__ == "__main__":
     parser.add_argument("--per_cell_class_min_count", type=int, default=20,
                         help="Per-class stratified metrics (with --type_cond): skip classes with "
                              "fewer than this many generated or GT graphs.")
+    parser.add_argument("--metric_report_level", type=str, default="standard",
+                        choices=["headline", "standard", "full"],
+                        help="Which metrics to print. Every metric is computed and written to "
+                             "metrics.json regardless -- this only filters the printed table.")
 
     args = parser.parse_args()
     main(args)

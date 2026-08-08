@@ -21,6 +21,34 @@ NEURON_TMD_N_BINS = 16
 NEURON_TMD_FILTRATIONS = ("path",)
 NEURON_TMD_DIM = len(NEURON_TMD_FILTRATIONS) * NEURON_TMD_N_BINS * NEURON_TMD_N_BINS  # 256
 
+# Evaluation filtration for the validation suite. Deliberately NOT in
+# NEURON_TMD_FILTRATIONS: scoring with the same filtration the model is conditioned on
+# would partly measure the model echoing its own input (dendrite_gen hits this; see its
+# VALIDATION_METRICS_SUMMARY.md blind spot 8.3). `radial_root` is also fully
+# rotation-invariant, which `height`/`rho` are not -- required for an E(3)-equivariant
+# model whose outputs come out in arbitrary global orientation.
+TMD_EVAL_FILTRATION = "radial_root"
+
+
+def compute_tmd_embedding(
+    G,
+    *,
+    filtration: str = TMD_EVAL_FILTRATION,
+    n_bins: int = NEURON_TMD_N_BINS,
+    sigma: float = 0.05,
+):
+    """Single-filtration TMD persistence-image embedding for evaluation.
+
+    Mirrors `dendrite_gen/utils/tmd.py:compute_tmd_embedding`. Intentionally a single
+    filtration -- cheaper than `compute_tmd_mixed`'s 3-filtration vector, and one
+    filtration outside the conditioning set is the point (see TMD_EVAL_FILTRATION).
+
+    Takes a networkx graph that must already be a rooted tree; callers should pass a
+    `validation.sanitise.sanitise_graph` output. Raises rather than returning a zero
+    vector, so a caller cannot silently drop malformed graphs from a pooled comparison.
+    """
+    return compute_tmd_mixed(G, filtrations=(filtration,), n_bins=n_bins, sigma=sigma)
+
 
 def compute_neuron_tmd(
     mol,

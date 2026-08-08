@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 import torch
+from torch.utils.checkpoint import checkpoint
 
 import semlaflow.util.functional as smolF
 
@@ -528,6 +529,7 @@ class EquiInvDynamics(torch.nn.Module):
         self_cond=False,
         coord_norm="length",
         eps=1e-6,
+        grad_checkpointing=False,
     ):
         super().__init__()
 
@@ -558,6 +560,9 @@ class EquiInvDynamics(torch.nn.Module):
         self.d_edge = d_edge
         self.bond_refine = bond_refine and d_edge is not None
         self.self_cond = self_cond
+        # Deliberately excluded from _hparams: it changes memory/compute only, never the weights
+        # or the outputs, so a checkpoint trained with it reloads and samples fine without it.
+        self.grad_checkpointing = grad_checkpointing
 
         core_layer = EquiMessagePassingLayer(
             d_model,
@@ -653,8 +658,19 @@ class EquiInvDynamics(torch.nn.Module):
         coords = coords * atom_mask.unsqueeze(-1)
 
         # Update coords and node feats using the model layers
+        checkpointing = self.grad_checkpointing and self.training and torch.is_grad_enabled()
         for layer in self.layers:
-            out = layer(coords, inv_feats, adj_matrix, atom_mask, edge_feats=edge_feats)
+            if checkpointing:
+                # Every layer materialises dense [B, N, N, d] tensors, so activation memory is
+                # O(N^2) per layer. Recomputing them in the backward pass trades ~30% compute for
+                # roughly an order of magnitude less memory, which is what makes the large tree
+                # corpora (N up to ~3000) trainable at all.
+                out = checkpoint(
+                    layer, coords, inv_feats, adj_matrix, atom_mask, edge_feats,
+                    use_reentrant=False,
+                )
+            else:
+                out = layer(coords, inv_feats, adj_matrix, atom_mask, edge_feats=edge_feats)
             if len(out) == 2:
                 coords, inv_feats = out
                 edge_feats = None
@@ -753,6 +769,7 @@ class SemlaGenerator(MolecularGenerator):
         super().__init__(**hparams)
 
         self.self_cond = self_cond
+        self.max_atoms = max_atoms
         self.tmd_dim = tmd_dim
         self.tmd_hidden = tmd_hidden
         self.n_classes = n_classes
@@ -856,7 +873,16 @@ class SemlaGenerator(MolecularGenerator):
 
         # Embed the number of atoms in a mol into a small vector and concat this to inv feats for each atom
         n_atoms = atom_mask.sum(dim=-1, keepdim=True)
-        # TODO: assert that n_atoms not larger than max_atoms
+        # size_emb is an Embedding(max_atoms) indexed by the raw node count, so a graph with
+        # exactly max_atoms nodes runs off the end of the table. Fail with a readable message
+        # rather than a bare IndexError (or a device-side assert on GPU).
+        largest = int(n_atoms.max())
+        if largest >= self.max_atoms:
+            raise ValueError(
+                f"Graph has {largest} nodes but the model was built with max_atoms="
+                f"{self.max_atoms}; the size embedding only covers 0..{self.max_atoms - 1}. "
+                f"Pass --max_atoms > {largest}."
+            )
         size_emb = self.size_emb(n_atoms).expand(-1, inv_feats.size(1), -1)
 
         inv_feats = torch.cat((inv_feats, size_emb), dim=-1)

@@ -3,18 +3,21 @@
 Strips RDKit-dependent metrics (validity, energy, stability, novelty) and
 replaces validation with a pure loss evaluation. Training losses are unchanged.
 
-In addition to the single-step `val-loss` (which drives checkpoint selection), the
-validation loop optionally runs a full ODE generation rollout over the val set and
-logs Wasserstein-1 structural distribution metrics (branch length, bifurcation
-angle/count, leaf/node counts, extents) vs the ground-truth val graphs. These are
-logged every validation so their trajectory over training is visible, mirroring the
-offline `sample_neurons.py:evaluate_samples` path. They are *not* monitored for
-checkpoint selection -- they exist to let a better checkpoint be chosen post-hoc.
+In addition to the single-step `val-loss`, the validation loop optionally runs a full ODE
+generation rollout over the val set and scores it against the ground-truth val graphs
+with `validation.dist_metrics`: W1 marginals, the joint morphometric block
+(`mmd_morpho` / density / coverage), a TMD persistence block, two scale-free normalised
+aggregates, and a structural health block. Mirrors the offline
+`sample_neurons.py:evaluate_samples` path.
+
+`val-morpho-selection` (mmd_morpho, gated on the health fractions) is available as a
+checkpoint monitor; see `train.py`. `val-loss` remains the default.
 """
 
 from __future__ import annotations
 
 import math
+import time
 
 import torch
 from torchmetrics import MetricCollection
@@ -32,7 +35,9 @@ class NeuronCFM(MolecularCFM):
     """
 
     def __init__(self, *args, val_structural_metrics: bool = True,
-                 per_cell_class: bool = True, per_cell_class_min_count: int = 20, **kwargs):
+                 per_cell_class: bool = True, per_cell_class_min_count: int = 20,
+                 metric_report_level: str = "standard",
+                 selection_health_max: dict | None = None, **kwargs):
         # Force-disable molecular post-processing paths.
         kwargs["pairwise_metrics"] = False
         kwargs["train_smiles"] = None
@@ -41,11 +46,15 @@ class NeuronCFM(MolecularCFM):
         kwargs["val_structural_metrics"] = val_structural_metrics
         kwargs["per_cell_class"] = per_cell_class
         kwargs["per_cell_class_min_count"] = per_cell_class_min_count
+        kwargs["metric_report_level"] = metric_report_level
+        kwargs["selection_health_max"] = selection_health_max
         super().__init__(*args, **kwargs)
 
         self.val_structural_metrics = val_structural_metrics
         self.per_cell_class = per_cell_class
         self.per_cell_class_min_count = per_cell_class_min_count
+        self.metric_report_level = metric_report_level
+        self.selection_health_max = dict(selection_health_max or {})
 
         # Replace the RDKit-driven metric collections with empty ones so any
         # stray .update() calls in base-class code are no-ops.
@@ -59,6 +68,16 @@ class NeuronCFM(MolecularCFM):
         # Parallel per-graph class labels (populated only for a class-conditioned run).
         self._val_gen_classes = []
         self._val_gt_classes = []
+        # Sampling-time accumulators: seconds spent inside `_generate` this epoch and the
+        # number of graphs the ODE integrated. Plain per-rank scalars; reduced via sync_dist
+        # in on_validation_epoch_end (same monitoring-only approximation as the W1 metrics).
+        self._val_sampling_seconds = 0.0
+        self._val_sampling_count = 0
+        # GT-derived fit (morpho mean/std, MMD bandwidths, TMD PCA) for the joint metrics.
+        # Built ONCE on the first real validation epoch and reused -- see
+        # on_validation_epoch_end for why that is valid and why it must skip the
+        # sanity-check loop.
+        self._gt_cache = None
 
     def validation_step(self, batch, b_idx):
         prior, data, interpolated, times = batch
@@ -92,7 +111,9 @@ class NeuronCFM(MolecularCFM):
 
         # Generation-based structural metrics: full ODE rollout from the prior, scored
         # against the GT val graphs in on_validation_epoch_end. Accumulate here.
-        if self.val_structural_metrics:
+        # Skipped during the sanity check, which scores nothing (see
+        # on_validation_epoch_end) -- this just avoids paying for a rollout twice.
+        if self.val_structural_metrics and not getattr(self.trainer, "sanity_checking", False):
             self._accumulate_structural_graphs(prior, data)
 
         return loss
@@ -110,8 +131,17 @@ class NeuronCFM(MolecularCFM):
         from semlaflow.data.swc import NEURON_EDGE_CLASS_INDEX
         from semlaflow.validation.convert import geometric_mol_to_nx, samples_to_mols
 
+        # Time only the ODE rollout (strict "sampling" cost). CUDA kernels are async, so
+        # synchronise on both sides or we'd time kernel launches, not the actual work.
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        _t0 = time.perf_counter()
         with torch.no_grad():
             gen = self._generate(prior, self.integrator.steps, self.sampling_strategy)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        self._val_sampling_seconds += time.perf_counter() - _t0
+        self._val_sampling_count += prior["coords"].size(0)
 
         gen_mols = samples_to_mols(gen, NEURON_EDGE_CLASS_INDEX)
         gt_mols = samples_to_mols(data, NEURON_EDGE_CLASS_INDEX)
@@ -131,11 +161,41 @@ class NeuronCFM(MolecularCFM):
             self._val_gen_classes.extend(kept)
             self._val_gt_classes.extend(kept)
 
+    def _log_run_constants(self, metrics):
+        """Push the per-run constants to logger config, once.
+
+        `mmd_bandwidth_*`, `tmd_eff_rank`, `morpho_gt_nan_frac` and `morpho_version` are
+        fixed by the GT fit, so logging them as a time series is pure noise -- but they
+        must be recorded somewhere, because `mmd_morpho` is meaningless without the
+        bandwidth and `morpho_version` is what tells you whether two runs' `mmd_morpho`
+        may share a plot axis.
+        """
+        from semlaflow.validation.dist_metrics import CONSTANT_KEYS
+
+        if getattr(self, "_logged_run_constants", False):
+            return
+        payload = {
+            f"metrics/{k}": metrics[k]
+            for k in CONSTANT_KEYS
+            if k in metrics and math.isfinite(metrics[k])
+        }
+        if not payload:
+            return
+        for logger in (self.loggers or []):
+            try:
+                logger.log_hyperparams(payload)
+            except Exception:
+                # A logger without hyperparameter support must not break validation.
+                pass
+        self._logged_run_constants = True
+
     def on_validation_epoch_start(self):
         self._val_gen_graphs = []
         self._val_gt_graphs = []
         self._val_gen_classes = []
         self._val_gt_classes = []
+        self._val_sampling_seconds = 0.0
+        self._val_sampling_count = 0
 
     def on_validation_epoch_end(self):
         if not self.val_structural_metrics:
@@ -143,36 +203,82 @@ class NeuronCFM(MolecularCFM):
         if not self._val_gen_graphs or not self._val_gt_graphs:
             return
 
-        import networkx as nx
+        # Skip the whole block during Lightning's sanity check. It runs only 2 batches, so
+        # every number it produced would be computed from a handful of graphs -- and, more
+        # importantly, `build_gt_cache` fitted there would derive morpho_mean/std/sigma
+        # from those few graphs and poison every subsequent epoch. This is the single
+        # easiest thing to get wrong in the whole suite.
+        if getattr(self.trainer, "sanity_checking", False):
+            return
 
-        from semlaflow.validation.dist_metrics import METRIC_KEYS, compute_distribution_metrics
+        from semlaflow.validation.dist_metrics import (
+            build_gt_cache,
+            compute_distribution_metrics,
+            keys_for_level,
+            subset_gt_cache,
+        )
+
+        # Fit the GT-derived objects ONCE and reuse them for the rest of the run, so the
+        # MMD trajectory is comparable across checkpoints (a per-epoch bandwidth would
+        # make the curve meaningless). Valid despite the transform's per-epoch random
+        # rotation: every morphometric is rotation invariant to ~1e-16 and `choose_root`
+        # was measured to flip on 0.0% of graphs under rotation.
+        if self._gt_cache is None:
+            self._gt_cache = build_gt_cache(self._val_gt_graphs)
 
         # NOTE: accumulation uses plain per-rank lists (not torchmetrics). Exact on a
         # single GPU; under DDP each rank scores its own shard and sync_dist averages the
-        # per-rank W1s (an approximation). This metric is for monitoring only -- checkpoint
-        # selection still uses val-loss -- so the approximation is acceptable.
-        metrics = compute_distribution_metrics(self._val_gen_graphs, self._val_gt_graphs)
+        # per-rank values. That is an approximation for the W1 marginals and an outright
+        # category error for MMD (the mean of per-rank MMDs is not the MMD of the union),
+        # which is why train.py warns when the morpho checkpoint monitor is used with
+        # world_size > 1.
+        metrics = compute_distribution_metrics(
+            self._val_gen_graphs, self._val_gt_graphs, gt_cache=self._gt_cache
+        )
 
-        finite_w1 = []
-        for key in METRIC_KEYS:
+        # `headline` keys also go to the progress bar. Each key must be logged exactly
+        # once per epoch -- Lightning rejects a second self.log() with different kwargs.
+        headline = set(keys_for_level("headline"))
+        for key in keys_for_level(self.metric_report_level):
             val = metrics.get(key)
             if val is not None and math.isfinite(val):
-                self.log(f"val-{key}", val, on_epoch=True, logger=True, sync_dist=True)
-                finite_w1.append(val)
+                self.log(f"val-{key}", val, on_epoch=True, logger=True,
+                         prog_bar=key in headline, sync_dist=True)
 
-        if finite_w1:
+        # `val-disconnected-frac` predates the health block and is on existing dashboards,
+        # so keep the old key name alive alongside the new `val-disconnected_frac`.
+        disc = metrics.get("disconnected_frac")
+        if disc is not None and math.isfinite(disc):
+            self.log("val-disconnected-frac", disc, on_epoch=True, logger=True, sync_dist=True)
+
+        # Checkpoint-selection signal. Sanitisation deliberately makes mmd_morpho blind to
+        # structural failure (it scores the repaired tree), so a model emitting
+        # garbage-with-a-plausible-MST would win on mmd_morpho alone. Gate it on the raw
+        # health fractions; +inf simply loses to any healthy epoch.
+        # (`val-mmd_morpho` itself is already logged by the tier loop above.)
+        mmd = metrics.get("mmd_morpho")
+        if mmd is not None and math.isfinite(mmd):
+            breached = [
+                k for k, limit in self.selection_health_max.items()
+                if math.isfinite(metrics.get(k, float("nan"))) and metrics[k] > limit
+            ]
             self.log(
-                "val-structural-w1-mean",
-                sum(finite_w1) / len(finite_w1),
-                on_epoch=True, logger=True, prog_bar=True, sync_dist=True,
+                "val-morpho-selection",
+                float("inf") if breached else mmd,
+                on_epoch=True, logger=True, sync_dist=True,
             )
 
-        n_disc = sum(
-            1 for g in self._val_gen_graphs
-            if g.number_of_nodes() > 0 and not nx.is_connected(g)
-        )
-        disc_frac = n_disc / len(self._val_gen_graphs)
-        self.log("val-disconnected-frac", disc_frac, on_epoch=True, logger=True, sync_dist=True)
+        # Per-run constants go to logger config, not the time series.
+        self._log_run_constants(metrics)
+
+        # Average ODE-rollout sampling time per generated graph. Per-rank ratio; sync_dist
+        # averages across ranks (same monitoring-only approximation as the W1 metrics above).
+        if self._val_sampling_count > 0:
+            self.log(
+                "val-sampling-seconds-per-sample",
+                self._val_sampling_seconds / self._val_sampling_count,
+                on_epoch=True, logger=True, sync_dist=True,
+            )
 
         # Per-neuron-type stratified metrics (class-conditioned runs only). Group the accumulated
         # gen/GT graphs by class label and score each subset separately; logged as
@@ -183,33 +289,35 @@ class NeuronCFM(MolecularCFM):
             and len(self._val_gen_classes) == len(self._val_gen_graphs)
             and len(self._val_gt_classes) == len(self._val_gt_graphs)
         ):
-            from semlaflow.scriptutil import NEURON_CELL_CLASS_NAMES
+            from semlaflow.scriptutil import class_label
 
+            # Names are per-corpus (neuron cell types vs tree genera); resolve via the dataset
+            # recorded in hparams by train.py. Falls back to `id<N>` for older checkpoints.
+            dataset = self.hparams.get("dataset")
             classes = sorted({c for c in self._val_gen_classes})
             for c in classes:
-                cname = (
-                    NEURON_CELL_CLASS_NAMES[c]
-                    if 0 <= c < len(NEURON_CELL_CLASS_NAMES) else f"id{c}"
-                )
+                cname = class_label(dataset, c)
                 gen_c = [g for g, gc in zip(self._val_gen_graphs, self._val_gen_classes) if gc == c]
                 gt_c = [g for g, gc in zip(self._val_gt_graphs, self._val_gt_classes) if gc == c]
                 if len(gen_c) < self.per_cell_class_min_count or len(gt_c) < self.per_cell_class_min_count:
                     continue
-                m_c = compute_distribution_metrics(gen_c, gt_c)
-                finite_c = []
-                for key in METRIC_KEYS:
+                # The GT reference must be THIS class's graphs, but the standardization,
+                # bandwidths and TMD PCA stay run-wide -- otherwise the per-class numbers
+                # are comparable neither to each other nor to the run-wide number.
+                cache_c = (
+                    subset_gt_cache(self._gt_cache, gt_c)
+                    if self._gt_cache is not None else None
+                )
+                m_c = compute_distribution_metrics(gen_c, gt_c, gt_cache=cache_c)
+                for key in keys_for_level(self.metric_report_level):
                     val = m_c.get(key)
                     if val is not None and math.isfinite(val):
-                        self.log(f"val-class_{cname}-{key}", val, on_epoch=True, logger=True, sync_dist=True)
-                        finite_c.append(val)
-                if finite_c:
-                    self.log(
-                        f"val-class_{cname}-w1-mean",
-                        sum(finite_c) / len(finite_c),
-                        on_epoch=True, logger=True, sync_dist=True,
-                    )
+                        self.log(f"val-class_{cname}-{key}", val, on_epoch=True,
+                                 logger=True, sync_dist=True)
 
         self._val_gen_graphs = []
         self._val_gt_graphs = []
         self._val_gen_classes = []
         self._val_gt_classes = []
+        self._val_sampling_seconds = 0.0
+        self._val_sampling_count = 0

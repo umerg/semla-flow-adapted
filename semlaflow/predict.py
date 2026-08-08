@@ -129,6 +129,9 @@ def load_model(args, vocab):
 
 
 def build_dm(args, hparams, vocab):
+    # Molecular datasets only -- this script decodes RDKit mols and writes SDF, which the SWC
+    # (neuron/tree) corpora cannot support. Raising on those is the intended behaviour; use
+    # sample_neurons.py instead. Deliberately not wired to scriptutil.DATASET_CONFIGS.
     if args.dataset == "qm9":
         coord_std = util.QM9_COORDS_STD_DEV
         bucket_limits = util.QM9_BUCKET_LIMITS
