@@ -306,20 +306,38 @@ over the val set each validation) as `val-<key>`. With a class-conditioned model
 additionally logged **per cell class** as `val-class_<name>-<key>`
 (see [§5](#5-neuron-type-cell-class-conditioning)).
 
-**Checkpoint selection.** `--ckpt_monitor` defaults to `val-loss`. Pass
-`val-morpho-selection` to select on `mmd_morpho` instead — gated on the health fractions,
-because sanitisation makes `mmd_morpho` blind to structural failure and a model emitting
-garbage with a plausible spanning tree would otherwise win:
+**Checkpoint selection.** A neuron run writes three families, all at `--val_check_epochs`:
+
+| prefix | monitor | count | contents |
+| --- | --- | --- | --- |
+| `best-` | `--ckpt_monitor` (default `val-loss`) | `--save_top_k` (default 1) + `last` | full (~437 MB) |
+| `morpho-` | `val-morpho-selection` | `--save_top_k` | full (~437 MB) |
+| `snap-` | — (every validation) | all | weights-only (~175 MB) |
+
+The `morpho-` family appears automatically whenever `--ckpt_monitor` is `val-loss` and the
+structural metrics are on, so **one run gives you both selections to compare**. They
+disagree in general: `val-loss` is a single-step denoising objective, `mmd_morpho` scores
+a full ODE rollout. Set `--ckpt_monitor val-morpho-selection` to make morphology the
+primary criterion instead (then only `best-` is written, monitoring it).
+
+`val-morpho-selection` is `mmd_morpho` gated on the health fractions, because sanitisation
+makes `mmd_morpho` blind to structural failure and a model emitting garbage with a
+plausible spanning tree would otherwise win:
 
 ```bash
---ckpt_monitor val-morpho-selection \
 --selection_max_disconnected_frac 0.05 --selection_max_cycle_frac 0.02
 ```
 
-Ceilings default to 1.0 (no gating); an epoch that breaches one scores `+inf` and loses to
-any healthy epoch. ⚠️ **Single-GPU only** — under DDP `sync_dist` averages per-rank
-scalars, and the mean of per-rank MMDs is not the MMD of the union. `train.py` prints a
-warning if it sees more than one visible GPU.
+⚠️ **Ceilings default to 1.0, i.e. no gating** — without at least one of these,
+`val-morpho-selection` is just raw `mmd_morpho`.
+
+⚠️ **Single-GPU only.** Under DDP `sync_dist` averages per-rank scalars, and MMD is
+quadratic in the samples, so the mean of per-rank MMDs is not the MMD of the union — a
+different quantity, not an approximation. `train.py` warns above one visible GPU.
+
+**Disk.** `--save_top_k` multiplies the two full-checkpoint families
+(2 × k × 437 MB); the `snap-` family is `epochs / val_check_epochs × 175 MB` regardless —
+300 epochs at `--val_check_epochs 5` is 60 snapshots ≈ 10.3 GB.
 
 The GT-derived fit (morphometric mean/std, MMD bandwidths, TMD PCA) is computed **once**
 on the first real validation epoch and reused for the whole run, so the `mmd_morpho`

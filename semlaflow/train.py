@@ -475,21 +475,34 @@ def build_trainer(args):
             every_n_epochs=val_check_epochs,
             monitor=monitor,
             mode="min",
-            save_top_k=1,
+            save_top_k=args.save_top_k,
             save_last=True,
             filename="best-{epoch:03d}",
         )
+        checkpointing = [best_ckpt]
+
+        # When selecting on loss, ALSO track the gated morphometric MMD under a separate
+        # prefix. The two disagree in general -- val-loss is a single-step denoising
+        # objective, mmd_morpho scores a full rollout -- and having both from one run is
+        # what lets you find out which one picks the better model on this data.
+        if args.val_structural_metrics and monitor != "val-morpho-selection":
+            checkpointing.append(ModelCheckpoint(
+                every_n_epochs=val_check_epochs,
+                monitor="val-morpho-selection",
+                mode="min",
+                save_top_k=args.save_top_k,
+                filename="morpho-{epoch:03d}",
+            ))
         # Periodic weights-only trajectory snapshots: keep all, so a better checkpoint can
         # be picked post-hoc by inspecting the logged structural-metric trajectories.
         # Weights-only (no optimizer/scheduler state) since these are for eval/sampling,
         # not training resumption; the EMA weights used for sampling live in the state_dict.
-        periodic_ckpt = ModelCheckpoint(
+        checkpointing.append(ModelCheckpoint(
             every_n_epochs=val_check_epochs,
             save_top_k=-1,
             save_weights_only=True,
             filename="snap-{epoch:03d}",
-        )
-        checkpointing = [best_ckpt, periodic_ckpt]
+        ))
     else:
         checkpointing = [
             ModelCheckpoint(
@@ -625,7 +638,14 @@ def get_parser() -> argparse.ArgumentParser:
         choices=["val-loss", "val-morpho-selection"],
         help="Metric driving best-checkpoint selection. 'val-morpho-selection' is "
              "mmd_morpho gated on the health fractions (see --selection_max_*). "
-             "Single-GPU only -- see the DDP warning."
+             "Single-GPU only -- see the DDP warning. When this is 'val-loss' the "
+             "morpho-selected checkpoint is saved too, under a 'morpho-' prefix."
+    )
+    parser.add_argument(
+        "--save_top_k", type=int, default=1,
+        help="How many monitored checkpoints to keep (per monitor). The full-precision "
+             "checkpoints are ~437 MB each, so raising this costs real disk. Independent "
+             "of the weights-only 'snap-' snapshots, which always keep every validation."
     )
     for _key, _flag in SELECTION_HEALTH_FLAGS.items():
         parser.add_argument(

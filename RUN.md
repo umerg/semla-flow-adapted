@@ -261,11 +261,17 @@ estimator and is legitimately slightly negative on a match; do not clip it.
 in **microns**. Do not compare them across corpora without converting — this is exactly
 what the normalised aggregates fix.
 
-**Selecting a checkpoint on morphology.** Add
-`--ckpt_monitor val-morpho-selection` plus at least one ceiling, e.g.
-`--selection_max_disconnected_frac 0.05`. Without a ceiling the gate never fires and you
-are selecting on raw `mmd_morpho`, which is blind to structural failure by design.
-Single-GPU only — see the DDP warning `train.py` prints.
+**Checkpoints.** Every neuron run writes `best-` (by `--ckpt_monitor`, default `val-loss`),
+`morpho-` (by the gated `mmd_morpho`) and `snap-` (weights-only, every validation, all
+kept). So **both selection criteria come out of one run** with no extra flags — compare
+them at the end. `--save_top_k` (default 1) raises how many of the two full-checkpoint
+families are kept; at ~437 MB each, mind the disk.
+
+**Making morphology the primary criterion.** Add `--ckpt_monitor val-morpho-selection`
+*plus at least one ceiling*, e.g. `--selection_max_disconnected_frac 0.05`. Without a
+ceiling the gate never fires and you are selecting on raw `mmd_morpho`, which is blind to
+structural failure by design. Single-GPU only — MMD is quadratic in the samples, so DDP's
+per-rank averaging gives a different quantity, not an approximation.
 
 **Per-class metrics are unreliable on the tree corpora.** Fagus is 88.2% of the data;
 per split the counts are:
