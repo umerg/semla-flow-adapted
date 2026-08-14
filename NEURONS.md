@@ -419,6 +419,9 @@ python -m semlaflow.train \
 - Every `--tmd_cond_every` epochs (default 5), a matched-pair fidelity block is
   logged as `val-tmd_cond-*`, capped at `--tmd_cond_max_pairs` pairs (default 64).
   `--no-tmd_cond_eval` turns it off. It is skipped entirely on an unconditional run.
+- Each validation epoch also logs a `val-plot-tmd_pairs` image: `Gen #i` in red above the
+  `GT #i` in blue whose descriptor conditioned it — the visual counterpart to those
+  numbers. See [§7](#7-validation-images).
 
 ### 4c. Sample with conditioning
 
@@ -690,6 +693,75 @@ and `--max_atoms 1537 / 3073`.
   doing so would put an estimator on one side of the comparison and the truth on the
   other, so a perfect generator would never score zero. The full argument, with the
   per-metric measurements, is [`COMPATIBLE.md` §4.11](COMPATIBLE.md#411-the-root-is-estimated-for-ground-truth-graphs-too-never-taken-from-the-data).
+
+---
+
+## 7. Validation images
+
+Every validation epoch logs sample-morphology grids to the logger (W&B only — `log_image` is
+skipped on loggers that lack it, so `--trial_run` and CSV runs are unaffected). One row per
+graph, one column per view angle, each graph rotated so its PCA principal axis points along
++z so the azimuth sweep orbits the trunk. Produced by `plot_graph_grid_angles`
+(`validation/plot.py`), the same helper `sample_neurons.py` uses offline.
+
+| key | logged when | rows |
+| --- | --- | --- |
+| `val-plot-class`, `val-plot-class-gt` | `class_hidden > 0` | one representative per cell class, labelled `Gen 5P-IT` / `GT 5P-IT` |
+| `val-plot-tmd_pairs` | `tmd_dim > 0` | interleaved `Gen #i` (red) / `GT #i` (blue) — the pair `gen[i]` was conditioned on |
+| `val-plot-examples`, `val-plot-examples-gt` | neither conditioner active | first N generated, plus first N GT |
+
+The three modes are **independent, not exclusive** — a run with both class and TMD
+conditioning gets the class grids *and* the pair grid.
+
+### The sanitisation overlay
+
+Graphs are plotted **raw**, and colour-coded by what `sanitise_graph` would do to each node
+and edge — so the critical tree the morphometrics actually scored is visible *inside* the raw
+emission. Colour carries membership, size carries level of detail:
+
+| state | rendering | what it means | health key |
+| --- | --- | --- | --- |
+| kept | row colour, full size | survives into the critical tree — this is what every metric saw | — |
+| contracted | row colour, **half size** | non-root degree-2 node collapsed by contraction | `non_critical_node_frac` |
+| fragment | **grey** node, grey **dashed** edge | outside the largest connected component | `lcc_node_frac`, `disconnected_frac` |
+| excess edge | **orange** | inside the LCC, cut by the MST — a cycle-closing edge | `excess_edge_frac`, `cycle_frac` |
+
+Reading it: same colour = same tree, smaller = detail the metrics collapsed, grey = the
+metrics never saw it, orange = an edge the MST removed. Only genuine defects are visually
+loud. Fragment edges are **dashed** as well as grey — the kept-edge colour is already
+`lightgray`, so a merely-paler solid line would read as a real long branch.
+
+**GT panels are a free control.** Sanitisation is a verified no-op on ground truth (0/2527
+neuron and 0/337 tree val graphs altered), so a GT row should render entirely in the kept
+state. Any orange, grey or shrunken node on a reference row means something upstream is
+wrong.
+
+Two caveats:
+
+- The classifier (`sanitise.sanitise_provenance`) **replays** `sanitise_graph` through the
+  same private helpers rather than restating their logic, and
+  `tests/validation_plots.py::test_kept_counts_match_sanitise_graph` pins that the kept counts
+  agree. Change a sanitise step without updating the classifier and that test fails.
+- `contracted` is **not** the same set as the raw-graph degree-2 nodes behind
+  `degree2_node_frac`. Contraction runs *after* the MST, and cutting an edge can turn a
+  degree-3 node into a degree-2 one. The plot shows what is actually contracted; the metric
+  counts the raw graph.
+
+Notes:
+
+- **Why raw rather than sanitised.** Every morphometric scores the repaired tree (largest
+  component → MST → contract), so the numbers structurally cannot show a disconnected or
+  over-connected generation. The images can, and that is most of what they add. Expect
+  early-training grids to show node clouds with no edges, or near-complete graphs drowning in
+  orange.
+- Pairing for `val-plot-tmd_pairs` is by index: `_val_gen_graphs` and `_val_gt_graphs` are
+  appended in the same order from the same batch, and no permutation is applied.
+- Class labels come from `class_label(dataset, idx)`, falling back to `id<N>` for a
+  checkpoint whose dataset declares no `class_names`.
+- Cost: `--val_plot_max_rows` (default 8) caps rows; `--no-val_plots` disables entirely.
+  3D rendering issues one draw call per edge, so the row cap is the knob that matters.
+- Class labels are accumulated whenever `class_hidden > 0`, independent of
+  `--no_per_cell_class` — that flag turns off the expensive per-class *metrics* only.
 
 ---
 

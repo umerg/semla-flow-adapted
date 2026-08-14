@@ -179,7 +179,7 @@ def second_highest_degree_multifurcation_frac(graphs: list[nx.Graph]) -> float:
     return hits / len(graphs)
 
 
-def _largest_component_relabelled(G: nx.Graph) -> nx.Graph:
+def _largest_component_relabelled(G: nx.Graph) -> tuple[nx.Graph, list]:
     """Largest connected component, relabelled to contiguous ids 0..M-1.
 
     Relabelling is mandatory, not cosmetic. `pca_base_root` returns
@@ -187,6 +187,11 @@ def _largest_component_relabelled(G: nx.Graph) -> nx.Graph:
     `geometric_mol_to_nx` guarantees node id == coords row to make that valid. A plain
     `G.subgraph(component)` keeps the original labels, so the index `choose_root` returns
     would address a different node, or none at all.
+
+    Returns ``(H, keep)``. ``keep`` is the sorted list of surviving *original* ids, so
+    ``keep[i]`` is the original id of new id ``i`` -- the inverse of the remap. Nothing else
+    in the pipeline records it, and `sanitise_provenance` needs it to map results back onto
+    the raw graph; returning it is cheaper and less fragile than reconstructing it.
     """
     components = list(nx.connected_components(G))
     keep = sorted(max(components, key=len))
@@ -197,7 +202,7 @@ def _largest_component_relabelled(G: nx.Graph) -> nx.Graph:
         H.add_node(remap[old], pos=np.asarray(G.nodes[old]["pos"], dtype=np.float64))
     for u, v in G.subgraph(keep).edges():
         H.add_edge(remap[u], remap[v])
-    return H
+    return H, keep
 
 
 def _min_spanning_tree(G: nx.Graph) -> nx.Graph:
@@ -335,7 +340,7 @@ def sanitise_graph(G: nx.Graph) -> nx.Graph:
         H.graph["axis"] = np.array([0.0, 0.0, 1.0])
         return H
 
-    H = _largest_component_relabelled(G)
+    H, _keep = _largest_component_relabelled(G)
     H = _min_spanning_tree(H)
 
     pts = np.stack([H.nodes[k]["pos"] for k in sorted(H.nodes())])
@@ -359,3 +364,75 @@ def sanitise_graph(G: nx.Graph) -> nx.Graph:
     H.graph["root"] = int(root)
     H.graph["axis"] = axial_axis(H)
     return H
+
+
+# Node and edge states reported by `sanitise_provenance`.
+PROVENANCE_NODE_STATES = ("kept", "contracted", "fragment")
+PROVENANCE_EDGE_STATES = ("kept", "excess", "fragment")
+
+
+def sanitise_provenance(G: nx.Graph) -> dict:
+    """Classify every raw node and edge by what `sanitise_graph` does to it.
+
+    The morphometrics all score the sanitised graph, so they structurally cannot show a
+    disconnected or over-connected generation. This is what lets a plot of the RAW graph
+    mark the critical tree the metrics actually saw. Returns raw node ids and raw
+    ``frozenset`` edges:
+
+        nodes   kept       survives into the critical tree
+                contracted in the spanning tree, collapsed by `_contract_degree_two`
+                fragment   outside the largest connected component
+        edges   kept       in the spanning tree
+                excess     inside the LCC, cut by the MST -- the cycle-closing edges
+                fragment   outside the LCC
+
+    Each triple partitions the raw graph exactly.
+
+    Edges follow the MST, not the contraction: a raw edge inside a contracted chain counts
+    as *kept*, because its geometry is represented in the critical tree by the single
+    substitute edge contraction puts in its place. Only the chain's interior nodes are
+    collapsed, and those are reported as ``contracted``.
+
+    This REPLAYS `sanitise_graph` through the same private helpers rather than restating
+    their logic, so the two cannot drift apart; `tests/validation_plots.py` pins that the
+    kept counts match `sanitise_graph` exactly. Note the state names describe the *actual*
+    pipeline, which is not always what the health metrics count -- contraction runs after
+    the MST, so `contracted` is not the raw-graph degree-2 set behind `degree2_node_frac`
+    (cutting an edge can turn a degree-3 node into a degree-2 one).
+    """
+    def _key(u, v):
+        return frozenset((u, v))
+
+    all_nodes = set(G.nodes())
+    all_edges = {_key(u, v) for u, v in G.edges()}
+    empty = {
+        "kept_nodes": set(), "contracted_nodes": set(), "fragment_nodes": all_nodes,
+        "kept_edges": set(), "excess_edges": set(), "fragment_edges": all_edges,
+    }
+    if G.number_of_nodes() == 0:
+        return empty
+
+    # Step 1: largest connected component. `keep[i]` is the raw id of relabelled id `i`.
+    H, keep = _largest_component_relabelled(G)
+    lcc_nodes = set(keep)
+    lcc_edges = {_key(keep[u], keep[v]) for u, v in H.edges()}
+
+    # Step 2: minimum spanning tree. Everything it drops is an edge inside the LCC.
+    T = _min_spanning_tree(H)
+    kept_edges = {_key(keep[u], keep[v]) for u, v in T.edges()}
+
+    # Steps 3-4: root selection, then degree-2 contraction. `_contract_degree_two` only
+    # ever removes nodes, so the difference is exactly the collapsed set.
+    pts = np.stack([T.nodes[k]["pos"] for k in sorted(T.nodes())])
+    root = choose_root(T, pts)
+    C = _contract_degree_two(T, root)
+    kept_nodes = {keep[i] for i in C.nodes()}
+
+    return {
+        "kept_nodes": kept_nodes,
+        "contracted_nodes": lcc_nodes - kept_nodes,
+        "fragment_nodes": all_nodes - lcc_nodes,
+        "kept_edges": kept_edges,
+        "excess_edges": lcc_edges - kept_edges,
+        "fragment_edges": all_edges - lcc_edges,
+    }

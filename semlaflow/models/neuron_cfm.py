@@ -39,7 +39,8 @@ class NeuronCFM(MolecularCFM):
                  metric_report_level: str = "standard",
                  selection_health_max: dict | None = None,
                  tmd_cond_eval: bool = True, tmd_cond_every: int = 5,
-                 tmd_cond_max_pairs: int = 64, **kwargs):
+                 tmd_cond_max_pairs: int = 64,
+                 val_plots: bool = True, val_plot_max_rows: int = 8, **kwargs):
         # Force-disable molecular post-processing paths.
         kwargs["pairwise_metrics"] = False
         kwargs["train_smiles"] = None
@@ -53,6 +54,8 @@ class NeuronCFM(MolecularCFM):
         kwargs["tmd_cond_eval"] = tmd_cond_eval
         kwargs["tmd_cond_every"] = tmd_cond_every
         kwargs["tmd_cond_max_pairs"] = tmd_cond_max_pairs
+        kwargs["val_plots"] = val_plots
+        kwargs["val_plot_max_rows"] = val_plot_max_rows
         super().__init__(*args, **kwargs)
 
         self.val_structural_metrics = val_structural_metrics
@@ -66,6 +69,10 @@ class NeuronCFM(MolecularCFM):
         self.tmd_cond_eval = tmd_cond_eval
         self.tmd_cond_every = max(1, int(tmd_cond_every))
         self.tmd_cond_max_pairs = int(tmd_cond_max_pairs)
+        # Sample-morphology images logged per validation epoch. 3D matplotlib is not free --
+        # `_plot_graph` issues one draw call per edge -- so the row count is capped.
+        self.val_plots = val_plots
+        self.val_plot_max_rows = max(1, int(val_plot_max_rows))
 
         # Replace the RDKit-driven metric collections with empty ones so any
         # stray .update() calls in base-class code are no-ops.
@@ -165,7 +172,11 @@ class NeuronCFM(MolecularCFM):
         # Stash class labels for per-cell-class stratification. Each generated graph's class is the
         # paired GT graph's class (gen is conditioned on it), so both lists get the same labels.
         # samples_to_mols drops all-masked graphs; align labels to the graphs actually built.
-        if self.per_cell_class and self.gen.class_hidden > 0 and data.get("cell_class") is not None:
+        #
+        # NOT gated on `per_cell_class`: that flag turns off the expensive per-class *metrics*,
+        # but the labels are a list of ints and the class-wise validation plots need them too.
+        # Gating the stash on it would make --no_per_cell_class silently drop the plots as well.
+        if self.gen.class_hidden > 0 and data.get("cell_class") is not None:
             masks = data["mask"].detach().cpu().bool()
             labels = data["cell_class"].detach().cpu().reshape(-1).tolist()
             kept = [int(labels[b]) for b in range(masks.size(0)) if int(masks[b].sum()) > 0]
@@ -199,6 +210,115 @@ class NeuronCFM(MolecularCFM):
                 # A logger without hyperparameter support must not break validation.
                 pass
         self._logged_run_constants = True
+
+    def _emit_figure(self, key, fig):
+        """Send one matplotlib figure to every logger that takes images, then release it.
+
+        No explicit `step`: Lightning's other wandb calls are stepless, so wandb
+        auto-increments its internal counter; injecting a global_step here would jump that
+        counter forward and risk wandb's monotonicity rule. Media panels ignore custom step
+        metrics anyway, so the epoch goes in the caption instead.
+        """
+        import matplotlib.pyplot as plt
+
+        try:
+            for logger in (self.loggers or []):
+                # Only WandbLogger has log_image; CSVLogger and --trial_run fall through.
+                if not hasattr(logger, "log_image"):
+                    continue
+                try:
+                    logger.log_image(key=key, images=[fig],
+                                     caption=[f"epoch {self.current_epoch}"])
+                except Exception:
+                    # An image failure must never take down validation.
+                    pass
+        finally:
+            plt.close(fig)
+
+    def _log_validation_plots(self):
+        """Log sample-morphology grids for this validation epoch.
+
+        Three modes, each keyed separately and each INDEPENDENT of the others -- a run that is
+        both class- and TMD-conditioned gets both figures:
+
+          class-conditioned  one row per cell class, plus the matching GT grid
+          TMD-conditioned    matched pairs, `Gen #i` above the `GT #i` that conditioned it
+          neither            plain first-N generated grid, plus the GT grid
+
+        Graphs are plotted RAW, not through `sanitise_graph`. The metrics deliberately score
+        the repaired tree; the images should show what the model actually emitted, fragments
+        and cycles included -- that is most of what they add over the numbers.
+        """
+        if not self.val_plots or not self._val_gen_graphs:
+            return
+        # Nothing rank-guards the rest of this method's caller, so without this every rank
+        # would emit its own copy of every image.
+        if not self.trainer.is_global_zero:
+            return
+
+        from semlaflow.scriptutil import class_label
+        from semlaflow.validation.plot import GT_COLOR, PRED_COLOR, plot_graph_grid_angles
+
+        max_rows = self.val_plot_max_rows
+        gen, gt = self._val_gen_graphs, self._val_gt_graphs
+
+        class_conditioned = (
+            getattr(self.gen, "class_hidden", 0) > 0
+            and self._val_gen_classes
+            and len(self._val_gen_classes) == len(gen)
+        )
+        tmd_conditioned = getattr(self.gen, "tmd_dim", 0) > 0
+
+        if class_conditioned:
+            # One representative per class: the first generated graph carrying that label, and
+            # the GT graph at the same index (gen[i] was conditioned on gt[i]).
+            dataset = self.hparams.get("dataset")
+            idx_by_class = {}
+            for i, c in enumerate(self._val_gen_classes):
+                idx_by_class.setdefault(int(c), i)
+            sel = [idx_by_class[c] for c in sorted(idx_by_class)][:max_rows]
+            names = [class_label(dataset, c) for c in sorted(idx_by_class)][:max_rows]
+
+            fig, _ = plot_graph_grid_angles(
+                [gen[i] for i in sel], per_graph_titles=[f"Gen {n}" for n in names],
+                max_graphs=len(sel), sanitise_overlay=True,
+            )
+            self._emit_figure("val-plot-class", fig)
+            fig, _ = plot_graph_grid_angles(
+                [gt[i] for i in sel], per_graph_titles=[f"GT {n}" for n in names],
+                node_color=GT_COLOR, max_graphs=len(sel), sanitise_overlay=True,
+            )
+            self._emit_figure("val-plot-class-gt", fig)
+
+        if tmd_conditioned:
+            # Interleave so each pair reads top-to-bottom. Half the rows are GT, so the pair
+            # count is half the row budget.
+            n_pairs = max(1, min(len(gen), len(gt), max_rows // 2))
+            rows, titles, colors = [], [], []
+            for i in range(n_pairs):
+                rows += [gen[i], gt[i]]
+                titles += [f"Gen #{i}", f"GT #{i}"]
+                # Colour the two apart: interleaved rows are otherwise told apart only by
+                # their titles, which is hard to read at a glance.
+                colors += [PRED_COLOR, GT_COLOR]
+            fig, _ = plot_graph_grid_angles(
+                rows, per_graph_titles=titles, per_graph_colors=colors,
+                max_graphs=len(rows), sanitise_overlay=True,
+            )
+            self._emit_figure("val-plot-tmd_pairs", fig)
+
+        if not class_conditioned and not tmd_conditioned:
+            n = min(len(gen), max_rows)
+            fig, _ = plot_graph_grid_angles(
+                gen[:n], title_prefix="Gen", max_graphs=n, sanitise_overlay=True
+            )
+            self._emit_figure("val-plot-examples", fig)
+            n_gt = min(len(gt), max_rows)
+            fig, _ = plot_graph_grid_angles(
+                gt[:n_gt], title_prefix="GT", node_color=GT_COLOR, max_graphs=n_gt,
+                sanitise_overlay=True,
+            )
+            self._emit_figure("val-plot-examples-gt", fig)
 
     def on_validation_epoch_start(self):
         self._val_gen_graphs = []
@@ -351,6 +471,9 @@ class NeuronCFM(MolecularCFM):
                     if val is not None and math.isfinite(val):
                         self.log(f"val-class_{cname}-{key}", val, on_epoch=True,
                                  logger=True, sync_dist=True)
+
+        # Sample-morphology images. Must run before the accumulators are cleared below.
+        self._log_validation_plots()
 
         self._val_gen_graphs = []
         self._val_gt_graphs = []

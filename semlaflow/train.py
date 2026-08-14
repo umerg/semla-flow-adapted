@@ -4,7 +4,7 @@ from pathlib import Path
 
 import lightning as L
 import torch
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 
 import semlaflow.scriptutil as util
@@ -44,7 +44,7 @@ DEFAULT_WARM_UP_STEPS = 10000
 DEFAULT_BUCKET_COST_SCALE = "quadratic"
 
 DEFAULT_N_VALIDATION_MOLS = 1800
-DEFAULT_VAL_CHECK_EPOCHS = 20
+DEFAULT_VAL_CHECK_EPOCHS = 10
 DEFAULT_NUM_INFERENCE_STEPS = 100
 DEFAULT_CAT_SAMPLING_NOISE_LEVEL = 1
 DEFAULT_COORD_NOISE_STD_DEV = 0.2
@@ -297,6 +297,8 @@ def build_model(args, dm, vocab):
         extra_cfm_kwargs["tmd_cond_eval"] = args.tmd_cond_eval
         extra_cfm_kwargs["tmd_cond_every"] = args.tmd_cond_every
         extra_cfm_kwargs["tmd_cond_max_pairs"] = args.tmd_cond_max_pairs
+        extra_cfm_kwargs["val_plots"] = args.val_plots
+        extra_cfm_kwargs["val_plot_max_rows"] = args.val_plot_max_rows
     fm_model = cfm_cls(
         egnn_gen,
         vocab,
@@ -478,7 +480,27 @@ def build_trainer(args):
     logger = None if args.trial_run else WandbLogger(
         project=project_name, save_dir="wandb", log_model=True
     )
-    lr_monitor = LearningRateMonitor(logging_interval="step")
+
+    # Make `epoch` the default x-axis for every panel.
+    #
+    # Without this, charts open on wandb's "Step", which is NOT the optimizer step: Lightning's
+    # WandbLogger never passes step= to wandb.log, so wandb's internal _step just counts log
+    # calls (~ global_step/log_every_n_steps, plus one per validation). Its scale is an
+    # artifact of the logging config, so two runs with different log_every_n_steps or
+    # val_check_epochs do not line up. The axis is also a per-project UI setting and
+    # `project_name` embeds the dataset, so every new --dataset starts a fresh project that
+    # would otherwise default back to "Step".
+    #
+    # Lightning's logger connector puts `epoch` in every payload it routes, so this works for
+    # all self.log() metrics. Guarded like neuron_cfm._log_run_constants: a logger without
+    # define_metric must not break the run.
+    if logger is not None:
+        try:
+            experiment = logger.experiment
+            experiment.define_metric("epoch")
+            experiment.define_metric("*", step_metric="epoch")
+        except Exception:
+            pass
     if args.dataset in util.NEURON_DATASETS:
         # Neurons don't have RDKit validity, so the best checkpoint is chosen either by
         # loss (default) or by the gated morphometric MMD.
@@ -547,7 +569,7 @@ def build_trainer(args):
         accumulate_grad_batches=args.acc_batches,
         gradient_clip_val=args.gradient_clip_val,
         check_val_every_n_epoch=val_check_epochs,
-        callbacks=[lr_monitor, *checkpointing],
+        callbacks=[*checkpointing],
         precision=args.precision,
     )
     return trainer
@@ -626,6 +648,13 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tmd_cond_max_pairs", type=int, default=64,
                         help="Cap on the number of index-matched pairs scored per run of the "
                              "matched-pair TMD evaluation.")
+    parser.add_argument("--val_plots", action=argparse.BooleanOptionalAction, default=True,
+                        help="Log sample-morphology grids to the logger each validation epoch "
+                             "(val-plot-*). Class-wise rows when class-conditioned, matched "
+                             "gen/GT pairs when TMD-conditioned, plain grids otherwise.")
+    parser.add_argument("--val_plot_max_rows", type=int, default=8,
+                        help="Row cap for the validation sample grids. 3D rendering costs one "
+                             "draw call per edge, so this bounds plotting time.")
 
     # Training args
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)

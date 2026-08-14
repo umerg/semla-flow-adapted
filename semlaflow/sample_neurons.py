@@ -361,11 +361,15 @@ def evaluate_samples(args, gen_mols: list[GeometricMol], save_dir: Path,
             print(f"{key:<30}{metrics[key]:.5f}")
     print()
 
-    # Multi-azimuth plot grids: generated and GT references at the same angles.
+    # Multi-azimuth plot grids: generated and GT references at the same angles. Graphs are
+    # raw, with the sanitisation overlay marking which parts the metrics above actually
+    # scored -- fragments grey, MST-cut edges orange, contracted degree-2 nodes shrunk. GT
+    # should come out entirely "kept" (sanitisation is a verified no-op there), so any
+    # colour on the reference grid points at something upstream.
     n = min(args.n_plot_examples, len(gen_graphs))
     gen_fig, gen_png = plot_graph_grid_angles(
         gen_graphs[:n], out_dir=save_dir, stem=Path(args.save_file).stem,
-        file_tag="gen3d", title_prefix="Gen", max_graphs=n,
+        file_tag="gen3d", title_prefix="Gen", max_graphs=n, sanitise_overlay=True,
     )
     plt.close(gen_fig)
     print(f"[eval] wrote generated plot grid -> {gen_png}")
@@ -374,6 +378,7 @@ def evaluate_samples(args, gen_mols: list[GeometricMol], save_dir: Path,
     ref_fig, ref_png = plot_graph_grid_angles(
         gt_graphs[:n_gt], out_dir=save_dir, stem=Path(args.save_file).stem,
         file_tag="ref3d", title_prefix="GT", node_color="#1f77b4", max_graphs=n_gt,
+        sanitise_overlay=True,
     )
     plt.close(ref_fig)
     print(f"[eval] wrote ground-truth plot grid -> {ref_png}")

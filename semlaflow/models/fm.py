@@ -594,10 +594,35 @@ class MolecularCFM(L.LightningModule):
         losses = self._loss(data, interpolated, predicted)
         loss = sum(list(losses.values()))
 
+        # Two series per loss, deliberately under separate names.
+        #
+        # The per-step one is the original and keeps its name so existing dashboards resolve.
+        # It is a single batch, and with `bucket_cost_scale="quadratic"` a batch is anywhere
+        # from 1 to 312 graphs depending on which bucket the sampler happened to draw (see
+        # data/util.py) -- so most of that curve's visible noise is bucket-identity noise
+        # rather than optimisation.
+        #
+        # The `-epoch` one is the sample-weighted epoch mean, which averages that away and
+        # gives one point per epoch lining up 1:1 with the `val-*` series. It is also the only
+        # DDP-correct train metric: the per-step logs have no sync_dist, so under multi-GPU
+        # they are rank-0 only.
         for name, loss_val in losses.items():
             self.log(f"train-{name}", loss_val, on_step=True, logger=True)
+            self.log(f"train-{name}-epoch", loss_val, on_step=False, on_epoch=True,
+                     logger=True, sync_dist=True)
 
         self.log("train-loss", loss, prog_bar=True, on_step=True, logger=True)
+        self.log("train-loss-epoch", loss, on_step=False, on_epoch=True,
+                 logger=True, sync_dist=True)
+
+        # Logged from the module rather than via LearningRateMonitor: that callback calls
+        # logger.log_metrics directly, bypassing Lightning's logger connector, so its payload
+        # carries no `epoch` key and the series plots empty on an epoch x-axis. Routing it
+        # through self.log fixes that. The scheduler steps per batch (see
+        # configure_optimizers), so this is the epoch-mean LR, not a within-epoch trace --
+        # hence the new name rather than reusing the callback's `lr-Adam`.
+        self.log("lr", self.optimizers().param_groups[0]["lr"],
+                 on_step=False, on_epoch=True, logger=True)
 
         return loss
 

@@ -273,6 +273,43 @@ Measured: at a 1e-5 edge false-positive rate, `cycle_frac` reaches 0.053 while
 `mmd_morpho` is *indistinguishable from clean*. Do not read a good `mmd_morpho` as a
 healthy model without checking these.
 
+### 5a. Reading the W&B curves
+
+**Everything plots against `epoch`.** Runs set `define_metric("*", step_metric="epoch")`, so
+new projects open on an epoch axis rather than wandb's "Step". That matters because "Step" is
+not the optimizer step: Lightning never passes `step=` to `wandb.log`, so wandb's counter just
+tallies log calls and its scale is an artifact of `log_every_n_steps` and `val_check_epochs`.
+Two runs with different values for either do not line up on it.
+
+**Prefer `train-loss-epoch` over `train-loss`.** Both are logged. `train-loss` is the original
+per-step series — one batch, and with `bucket_cost_scale="quadratic"` a batch is anywhere from
+1 to 312 graphs depending on which bucket the sampler drew, so most of that curve's visible
+noise is bucket-identity noise rather than optimisation. `train-loss-epoch` is the
+sample-weighted epoch mean (and the only DDP-correct one), with one point per epoch that lines
+up 1:1 with the `val-*` series. Same for each component: `train-coord-loss-epoch`, etc.
+
+**`lr` replaces `lr-Adam`.** `LearningRateMonitor` logged straight to the logger, bypassing
+Lightning's connector, so its payload carried no `epoch` key and the series plotted empty on an
+epoch axis. The LR now comes from the module as `lr` — an epoch mean, since the schedule steps
+per batch. Old `lr-Adam` panels will not populate on new runs.
+
+**Sample images: `val-plot-*`**, logged once per validation epoch. Graphs are raw, *not*
+sanitised — the point is to see the fragments and cycles the morphometrics cannot — and
+colour-coded by what sanitisation would do to them: **grey** = outside the largest component
+(dashed edges), **orange** = an edge the MST cuts, **half-size** = a degree-2 node contraction
+collapses, full row colour = the critical tree every metric actually scored. GT rows should be
+entirely plain, since sanitisation is a no-op on ground truth. Same overlay on
+`sample_neurons.py`'s `_gen3d.png` / `_ref3d.png`.
+
+| key | when | rows |
+| --- | --- | --- |
+| `val-plot-class`, `val-plot-class-gt` | `--type_conditioning` | one per cell class, labelled by name |
+| `val-plot-tmd_pairs` | `--tmd_conditioning` | `Gen #i` (red) above the `GT #i` (blue) that conditioned it |
+| `val-plot-examples`, `val-plot-examples-gt` | neither | first N |
+
+The modes are independent: a run with both conditioners gets the class grid *and* the pair
+grid. `--no-val_plots` disables them; `--val_plot_max_rows` (default 8) bounds the cost.
+
 **Use the normalised aggregates, not a raw mean of the `*_w1` keys.**
 `w1_pooled_mean_normalized` and `w1_pertree_mean_normalized` divide each W1 by the GT
 spread. A raw mean mixes microns, degrees and counts, and **which key dominates flips
@@ -373,6 +410,10 @@ python -m semlaflow.train \
   If you ever see plausible-but-wrong extents from an old checkpoint, this was why.
 - **W&B creates one project per dataset** (`equinv-trees_genus_d10`, etc.). For
   cross-depth comparison in a single workspace, use a shared project and a `depth` tag.
+  The chart x-axis is a **per-project UI setting**, so changing `--dataset` used to drop you
+  into a fresh project whose charts defaulted back to "Step". Runs now call
+  `define_metric("*", step_metric="epoch")` so every new project opens on epochs; older
+  projects keep whatever axis you set by hand.
 - **Local (macOS) runs**: `NEURO2` has no `wandb`, and the dataset holds a thread lock
   so `spawn` workers fail — set `dm._num_workers = 0`. A full-size d15/d20 graph is not
   runnable on the laptop; smoke-test on d10 or on graphs under ~200 nodes.
