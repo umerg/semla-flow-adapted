@@ -132,11 +132,22 @@ Notes:
   (COMPATIBLE.md §4.15).
 - Sampling **fails** if the checkpoint's filtrations differ from the dataset's. Both
   sets are 512-dim, so this guard is the only thing that catches a mismatched `.smol`.
-- Watch `val-tmd_cond-pd_wasserstein_path_mean` (logged every 5 epochs) for whether the
-  conditioning is being followed. On a conditioned run `mmd_tmd` cannot tell you that —
-  its filtration is one the model trained on (COMPATIBLE.md §4.14).
+- Watch `val-tmd_cond-pd_wasserstein_path_mean` for whether the conditioning is being
+  followed. On a conditioned run `mmd_tmd` cannot tell you that — its filtration is one
+  the model trained on (COMPATIBLE.md §4.14).
 - PD distances need `persim` (already in the `NEURO2` env). Without it they read `nan`
   and `pd_nan_frac_*` reads 1.0; the extent and W1 entries still compute.
+
+Cost knobs for that block, all training-side and ignored on an unconditional run:
+
+| flag | default | effect |
+| --- | --- | --- |
+| `--tmd_cond_every` | `5` | run the matched-pair evaluation every N validation epochs |
+| `--tmd_cond_max_pairs` | `64` | cap on pairs scored per run (a persim Wasserstein per pair per filtration) |
+| `--no-tmd_cond_eval` | — | skip it entirely |
+
+`sample_neurons.py` has its own `--tmd_cond_max_pairs` (default `256`) for the offline
+`"tmd_cond"` block in `metrics.json`.
 
 ---
 
@@ -209,8 +220,10 @@ Sampling is unchanged from d10 apart from `--data_path` — `--precision` and
 hparam, so a checkpoint trained with them samples fine without them.
 
 **Consider `--no_val_structural_metrics` for d20.** The structural validation metrics
-run a full ODE rollout over the val set every `--val_check_epochs`. At d20 sizes that
-is expensive; disabling it trades the metric trajectory for wall-clock.
+run a full ODE rollout over the val set every `--val_check_epochs` (default **10**, so 30
+validations over a 300-epoch run). At d20 sizes that is expensive; disabling it trades the
+metric trajectory for wall-clock. Raising `--val_check_epochs` is the softer version of
+the same trade — it thins the trajectory instead of removing it.
 
 ---
 
@@ -395,6 +408,21 @@ python -m semlaflow.train \
     --dataset neurons \
     --data_path /Users/umer/Documents/neurons_final_smol
 ```
+
+### Identifying which corpus an old `.smol` came from
+
+Generated samples carry no dataset name, and the two neuron corpora are easy to confuse.
+`sample_neurons.py` feeds **ground-truth node counts into the prior**, so the generated
+node-count distribution is an exact fingerprint of the split it was sampled from:
+
+| corpus | val `.smol` | n | mean N | max N |
+| --- | --- | ---: | ---: | ---: |
+| `neurons` | `neurons_final_smol/val.smol` | 1847 | 49.3 | 149 |
+| `neurons_conditional` | `neurons_conditional/smol/val.smol` | 2527 | 60.1 | 217 |
+
+Match `len(samples)` and `max(seq_length)` against that table before scoring anything —
+picking the wrong reference silently shifts every W1. Note `neurons_conditional_full/`
+exists on disk but is **not** registered in `DATASET_CONFIGS` and has no `smol/`.
 
 ---
 
