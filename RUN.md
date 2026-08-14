@@ -97,6 +97,47 @@ Notes:
   support; re-run preprocessing if you want it).
 - Expect `Class conditioning enabled: n_classes=7 (23P, 4P, ...)`.
 
+### 1a. TMD conditioning
+
+Orthogonal to `--type_conditioning`; both can be on at once. Needs a re-preprocess,
+because the descriptor is computed and stored at that stage.
+
+```bash
+# preprocess WITH descriptors (default set: path + radial_root -> 512-dim)
+python -m semlaflow.preprocess_neurons \
+    --input_dir  /Users/umer/Documents/neurons_conditional \
+    --output_dir /Users/umer/Documents/neurons_conditional/smol_tmd \
+    --val_dir_name val \
+    --compute_tmd --tmd_filtrations path radial_root
+
+# train
+python -m semlaflow.train \
+    --dataset neurons_conditional \
+    --data_path /Users/umer/Documents/neurons_conditional/smol_tmd \
+    --tmd_conditioning --tmd_hidden 64
+
+# sample + evaluate (paired: each sample gets a real graph's descriptor)
+python -m semlaflow.sample_neurons \
+    --ckpt_path <ckpt> \
+    --data_path /Users/umer/Documents/neurons_conditional/smol_tmd \
+    --save_dir  <out> \
+    --tmd_cond
+```
+
+Notes:
+- Expect `TMD conditioning enabled: tmd_dim=512 (path, radial_root), tmd_hidden=64`.
+  A `tmd_dim=256` here means the `.smol` was built with one filtration — re-preprocess.
+- `--tmd_filtrations` takes only `path` and `radial_root`. `height`/`rho` are rejected:
+  they need a fixed anatomical axis that the random-rotation transform destroys
+  (COMPATIBLE.md §4.15).
+- Sampling **fails** if the checkpoint's filtrations differ from the dataset's. Both
+  sets are 512-dim, so this guard is the only thing that catches a mismatched `.smol`.
+- Watch `val-tmd_cond-pd_wasserstein_path_mean` (logged every 5 epochs) for whether the
+  conditioning is being followed. On a conditioned run `mmd_tmd` cannot tell you that —
+  its filtration is one the model trained on (COMPATIBLE.md §4.14).
+- PD distances need `persim` (already in the `NEURO2` env). Without it they read `nan`
+  and `pd_nan_frac_*` reads 1.0; the extent and W1 entries still compute.
+
 ---
 
 ## 2. `trees_genus_d10` — the cheap one, use it to iterate

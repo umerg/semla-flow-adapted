@@ -37,7 +37,9 @@ class NeuronCFM(MolecularCFM):
     def __init__(self, *args, val_structural_metrics: bool = True,
                  per_cell_class: bool = True, per_cell_class_min_count: int = 20,
                  metric_report_level: str = "standard",
-                 selection_health_max: dict | None = None, **kwargs):
+                 selection_health_max: dict | None = None,
+                 tmd_cond_eval: bool = True, tmd_cond_every: int = 5,
+                 tmd_cond_max_pairs: int = 64, **kwargs):
         # Force-disable molecular post-processing paths.
         kwargs["pairwise_metrics"] = False
         kwargs["train_smiles"] = None
@@ -48,6 +50,9 @@ class NeuronCFM(MolecularCFM):
         kwargs["per_cell_class_min_count"] = per_cell_class_min_count
         kwargs["metric_report_level"] = metric_report_level
         kwargs["selection_health_max"] = selection_health_max
+        kwargs["tmd_cond_eval"] = tmd_cond_eval
+        kwargs["tmd_cond_every"] = tmd_cond_every
+        kwargs["tmd_cond_max_pairs"] = tmd_cond_max_pairs
         super().__init__(*args, **kwargs)
 
         self.val_structural_metrics = val_structural_metrics
@@ -55,6 +60,12 @@ class NeuronCFM(MolecularCFM):
         self.per_cell_class_min_count = per_cell_class_min_count
         self.metric_report_level = metric_report_level
         self.selection_health_max = dict(selection_health_max or {})
+        # Matched-pair TMD conditioning fidelity. Only meaningful when the model is TMD
+        # conditioned, and expensive per pair (a persim Wasserstein per filtration), so it
+        # is both gated on `gen.tmd_dim > 0` and run every `tmd_cond_every` epochs.
+        self.tmd_cond_eval = tmd_cond_eval
+        self.tmd_cond_every = max(1, int(tmd_cond_every))
+        self.tmd_cond_max_pairs = int(tmd_cond_max_pairs)
 
         # Replace the RDKit-driven metric collections with empty ones so any
         # stray .update() calls in base-class code are no-ops.
@@ -270,6 +281,32 @@ class NeuronCFM(MolecularCFM):
 
         # Per-run constants go to logger config, not the time series.
         self._log_run_constants(metrics)
+
+        # Matched-pair TMD conditioning fidelity. Everything above is distributional and,
+        # now that the evaluation filtration also sits in the conditioning set, partly
+        # scores the model echoing its own input. These per-pair numbers are the evidence
+        # that the conditioning is actually being followed, so they are worth their cost --
+        # but only when the model is conditioned at all.
+        if (
+            self.tmd_cond_eval
+            and getattr(self.gen, "tmd_dim", 0) > 0
+            and (self.current_epoch + 1) % self.tmd_cond_every == 0
+        ):
+            from semlaflow.validation.tmd_conditional_eval import (
+                compute_conditional_pairwise_metrics,
+            )
+
+            # `gen_graphs[i]` was conditioned on `gt_graphs[i]`: both lists are appended in
+            # batch order from the same validation_step, and no permutation is applied.
+            cond_metrics = compute_conditional_pairwise_metrics(
+                self._val_gen_graphs,
+                self._val_gt_graphs,
+                max_pairs=self.tmd_cond_max_pairs,
+            )
+            for key, val in cond_metrics.items():
+                if math.isfinite(val):
+                    self.log(f"val-tmd_cond-{key}", val, on_epoch=True,
+                             logger=True, sync_dist=True)
 
         # Average ODE-rollout sampling time per generated graph. Per-rank ratio; sync_dist
         # averages across ranks (same monitoring-only approximation as the W1 metrics above).

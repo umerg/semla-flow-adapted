@@ -457,10 +457,50 @@ Two related notes:
   removes their causes (0.0053/0.0271/0.1263 → 0.0000 at 1/5/20% edge dropout). They are
   kept for field-for-field parity with dendrite_gen; the §4.12 health block is the live
   disclosure for SemlaFlow's own failure modes.
-- **Unlike dendrite_gen, `mmd_tmd` here is independent evidence.** Their blind spot §8.3 —
-  that the evaluation filtration sits inside the model's conditioning set — does not apply:
-  SemlaFlow conditions on `path` only (`tmd/__init__.py:NEURON_TMD_FILTRATIONS`) while
-  evaluation uses `radial_root`.
+- **On a TMD-conditioned run, `mmd_tmd` and `tmd_barlen_w1` are NOT independent evidence.**
+  dendrite_gen's blind spot §8.3 — the evaluation filtration sitting inside the model's
+  conditioning set — now applies here too. It did not when SemlaFlow conditioned on `path`
+  alone, but the conditioning set is now `("path", "radial_root")` and evaluation still uses
+  `radial_root`, so both metrics partly score the model reproducing its own input. See §4.15
+  for why no fourth filtration is available to move evaluation onto.
+
+  This is disclosed rather than fixed, and it is a real limitation: on a conditioned run,
+  read those two as consistency checks, not as fidelity. The metrics that *are* independent
+  evidence of conditioning fidelity are the matched-pair ones in
+  `validation/tmd_conditional_eval.py`, logged as `val-tmd_cond-*` (in-loop) and written to
+  `metrics.json` under `"tmd_cond"` (offline). They pair each generated graph with the
+  specific GT graph whose descriptor produced it, so no amount of population-level mimicry
+  can flatter them. On an unconditional run nothing changes: `mmd_tmd` remains independent
+  and the `val-tmd_cond-*` block is not computed at all.
+
+### 4.15 Only rotation-invariant filtrations can be conditioned on
+
+`compute_tmd_mixed` implements four filtrations — `path`, `height`, `rho`, `radial_root` —
+but `NEURON_TMD_SUPPORTED_FILTRATIONS` admits only `path` and `radial_root`, and
+`preprocess_neurons.py --tmd_filtrations` will not accept the other two.
+
+`height` (projection onto an axis) and `rho` (distance from that axis) are defined relative
+to a fixed anatomical frame. dendrite_gen has one — it is SO(2)-equivariant about a
+configured `so2_axis` (`[0., 1., 0.]` for neurons), so the descriptor and the geometry share
+a frame and "reaches far along the apical axis" is a statement the model can act on.
+
+SemlaFlow has no such frame. `scriptutil.neuron_mol_transform` applies a uniformly random 3D
+rotation on every `__getitem__`, and `SemlaGenerator` is E(3)-equivariant. The TMD vector is
+computed once at preprocess time in the SWC's own frame and is *not* recomputed per epoch, so
+an axis-dependent channel would tell the model about an axis its input coordinates no longer
+agree with. The axis half of the signal is not merely noisy — it is unresolvable, and the
+model can only learn to ignore it. This is the same frame problem as §4.14's, applied to
+conditioning instead of metrics.
+
+`path` (geodesic distance from the soma) and `radial_root` (straight-line distance from the
+soma) are invariant under rotation about the root, so they survive the augmentation intact —
+verified to ~1e-7 in `tests/tmd_conditioning.py`. They are also complementary rather than
+redundant: their ratio is what contraction/tortuosity measures.
+
+Making `height`/`rho` usable would mean canonicalising the frame — replacing the random
+rotation with a deterministic alignment — which changes the symmetry the model is trained
+under and invalidates comparison with existing checkpoints. That is a separate decision, not
+a filtration-set change.
 
 ---
 

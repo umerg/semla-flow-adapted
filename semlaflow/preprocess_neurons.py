@@ -22,6 +22,12 @@ import torch
 from tqdm import tqdm
 
 from semlaflow.data.swc import swc_to_geometric_mol
+from semlaflow.tmd import (
+    NEURON_TMD_FILTRATIONS,
+    NEURON_TMD_SUPPORTED_FILTRATIONS,
+    neuron_tmd_dim,
+    validate_filtrations,
+)
 from semlaflow.util.molrepr import GeometricMolBatch
 
 
@@ -38,7 +44,7 @@ def _list_swc(dir_path: Path) -> list[Path]:
 
 
 def _convert(files: list[Path], max_atoms: int, split_name: str, compute_tmd: bool = False,
-             tmd_filtrations: tuple = ("path",)):
+             tmd_filtrations: tuple = NEURON_TMD_FILTRATIONS):
     mols = []
     dropped = 0
     for f in tqdm(files, desc=f"parsing {split_name}"):
@@ -50,6 +56,9 @@ def _convert(files: list[Path], max_atoms: int, split_name: str, compute_tmd: bo
             from semlaflow.tmd import compute_neuron_tmd
 
             mol._tmd = compute_neuron_tmd(mol, filtrations=tmd_filtrations)
+            # Stamp the provenance alongside the vector so the .smol is self-describing:
+            # two filtration sets of the same size are otherwise indistinguishable.
+            mol._tmd_filtrations = tuple(tmd_filtrations)
         mols.append(mol)
     if dropped:
         print(f"[{split_name}] dropped {dropped} graphs with > {max_atoms} nodes")
@@ -105,9 +114,12 @@ def main():
         "--tmd_filtrations",
         type=str,
         nargs="+",
-        default=["path"],
-        choices=["path", "height", "rho"],
-        help="Filtrations for the TMD vector (default: path-only, rotation-invariant).",
+        default=list(NEURON_TMD_FILTRATIONS),
+        choices=list(NEURON_TMD_SUPPORTED_FILTRATIONS),
+        help="Filtrations concatenated into the TMD vector, one 16x16 persistence image each "
+             f"(default: {' '.join(NEURON_TMD_FILTRATIONS)} -> dim {neuron_tmd_dim()}). Only "
+             "rotation-invariant filtrations are offered; `height`/`rho` need a fixed anatomical "
+             "axis that the random-rotation transform destroys (see COMPATIBLE.md §4.15).",
     )
     args = parser.parse_args()
 
@@ -137,9 +149,17 @@ def main():
     print(f"test  files: {len(test_files) if test_files else 0}"
           f"{'' if test_files else '  (no test split -- test.smol will not be written)'}")
 
-    tmd_filtrations = tuple(args.tmd_filtrations)
+    # argparse `choices` rejects unknown names; this also catches duplicates, which would
+    # silently widen the vector with a repeated block.
+    try:
+        tmd_filtrations = validate_filtrations(args.tmd_filtrations)
+    except ValueError as err:
+        raise SystemExit(str(err)) from err
     if args.compute_tmd:
-        print(f"Computing TMD conditioning vectors (filtrations={tmd_filtrations})...")
+        print(
+            f"Computing TMD conditioning vectors "
+            f"(filtrations={', '.join(tmd_filtrations)} -> dim {neuron_tmd_dim(tmd_filtrations)})..."
+        )
     train_mols = _convert(train_files, args.max_atoms, "train", args.compute_tmd, tmd_filtrations)
     val_mols = _convert(val_files, args.max_atoms, "val", args.compute_tmd, tmd_filtrations)
     test_mols = (
@@ -149,7 +169,10 @@ def main():
 
     if args.compute_tmd and train_mols:
         tmd_dim = int(train_mols[0]._tmd.shape[0])
-        print(f"== TMD vector dim: {tmd_dim} == (pass --tmd_conditioning to train.py to use it)\n")
+        expected = neuron_tmd_dim(tmd_filtrations)
+        assert tmd_dim == expected, f"TMD dim {tmd_dim} != expected {expected}"
+        print(f"== TMD vector dim: {tmd_dim} ({' + '.join(tmd_filtrations)}) == "
+              "(pass --tmd_conditioning to train.py to use it)\n")
 
     # Cell-class label summary (class-labelled corpora only): confirms every graph carries a
     # `# cell_class N` header and shows the class balance before training with --type_conditioning.

@@ -272,6 +272,7 @@ class GeometricMol(SmolMol):
         is_mmap: bool = False,
         str_id: Optional[str] = None,
         tmd: Optional[_T] = None,
+        tmd_filtrations: Optional[tuple] = None,
         cell_class: Optional[int] = None,
     ):
         # Check that each tensor has correct number of dimensions
@@ -310,6 +311,12 @@ class GeometricMol(SmolMol):
         # Optional per-graph conditioning vector (e.g. TMD). Carried through transforms,
         # batching, and (de)serialization untouched; None when unused.
         self._tmd = tmd
+        # Which filtrations `_tmd` was built from, in concatenation order. Provenance only --
+        # never collated or fed to the model. Two different filtration sets of the same size
+        # produce indistinguishable vectors, so without this a .smol can be trained on (or
+        # sampled from) with the wrong descriptor and nothing would flag it. Stored as a
+        # plain tuple of str; None for vectors written before this field existed.
+        self._tmd_filtrations = None if tmd_filtrations is None else tuple(tmd_filtrations)
         # Optional per-graph discrete class label (e.g. neuron cell class). Stored as a
         # 0-dim int64 tensor (stacks cleanly to (B,) in collate); None when unused.
         self._cell_class = (
@@ -383,6 +390,13 @@ class GeometricMol(SmolMol):
         return torch.as_tensor(self._tmd).float()
 
     @property
+    def tmd_filtrations(self) -> Optional[tuple]:
+        """Filtrations `tmd` was built from, in order, or None if unrecorded."""
+        if self._tmd_filtrations is None:
+            return None
+        return tuple(self._tmd_filtrations)
+
+    @property
     def cell_class(self) -> Optional[_T]:
         """Optional per-graph discrete class label (0-dim int64 tensor), or None if unset."""
         if self._cell_class is None:
@@ -435,6 +449,9 @@ class GeometricMol(SmolMol):
             is_mmap=False,
             str_id=obj["id"],
             tmd=obj.get("tmd"),  # backward compatible: old .smol files have no TMD
+            # None on .smol files written before provenance was recorded; consumers warn
+            # rather than raise on that, so old data still trains.
+            tmd_filtrations=obj.get("tmd_filtrations"),
             cell_class=obj.get("cell_class"),  # backward compatible: old .smol files have no label
         )
         return mol
@@ -486,6 +503,7 @@ class GeometricMol(SmolMol):
             "device": str(self.device),
             "id": self._str_id,
             "tmd": None if self._tmd is None else torch.as_tensor(self._tmd).cpu(),
+            "tmd_filtrations": self._tmd_filtrations,
             "cell_class": None if self._cell_class is None else torch.as_tensor(self._cell_class).cpu(),
         }
         byte_obj = pickle.dumps(dict_repr, protocol=PICKLE_PROTOCOL)
@@ -515,6 +533,7 @@ class GeometricMol(SmolMol):
         bond_types: Optional[_T] = None,
         charges: Optional[_T] = None,
         tmd: Optional[_T] = None,
+        tmd_filtrations: Optional[tuple] = None,
         cell_class: Optional[int] = None,
     ) -> GeometricMol:
 
@@ -524,7 +543,10 @@ class GeometricMol(SmolMol):
         bond_types = self.bond_types if bond_types is None else bond_types
         charges = self.charges if charges is None else charges
         # Preserve the conditioning fields across transforms unless explicitly replaced.
+        # `neuron_mol_transform` rebuilds every mol on each __getitem__, so dropping these
+        # here would silently disable conditioning after the first epoch.
         tmd = self._tmd if tmd is None else tmd
+        tmd_filtrations = self._tmd_filtrations if tmd_filtrations is None else tmd_filtrations
         cell_class = self._cell_class if cell_class is None else cell_class
 
         obj = GeometricMol(
@@ -537,6 +559,7 @@ class GeometricMol(SmolMol):
             is_mmap=False,
             str_id=self._str_id,
             tmd=tmd,
+            tmd_filtrations=tmd_filtrations,
             cell_class=cell_class,
         )
         return obj

@@ -117,12 +117,14 @@ def filtration_radial_root(G: nx.Graph) -> Dict[int, float]:
     Unlike ``rho`` (distance from the z-axis) or ``height`` (z), this is the canonical
     Kanari-style radial filtration anchored at the soma/root. It encodes branching
     topology weighted by spatial reach and is fully rotation-invariant -- which is why it
-    is the evaluation filtration here: SEMLA is E(3)-equivariant, so the axis-dependent
-    filtrations are unusable for scoring generated graphs.
+    is both SemlaFlow's evaluation filtration and half of its conditioning set: SEMLA is
+    E(3)-equivariant and the neuron transform rotates randomly, so the axis-dependent
+    filtrations are unusable for either job.
 
-    It is also deliberately *outside* SemlaFlow's conditioning set
-    (``NEURON_TMD_FILTRATIONS = ("path",)``), so ``mmd_tmd`` is independent evidence
-    rather than a measure of the model echoing its own conditioning input.
+    Because it serves both roles, ``mmd_tmd``/``tmd_barlen_w1`` partly measure the model
+    reproducing its own conditioning input. See ``tmd/__init__.py:TMD_EVAL_FILTRATION``
+    and COMPATIBLE.md §4.14 for the disclosure, and ``validation.tmd_conditional_eval``
+    for the matched-pair metrics that are not subject to it.
     """
     assert_rooted_tree_graph(G)
     root = G.graph["root"]

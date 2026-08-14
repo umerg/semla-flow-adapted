@@ -107,6 +107,8 @@ def build_model(args, dm, vocab):
     tmd_dim = 0
     tmd_hidden = 0
     if getattr(args, "tmd_conditioning", False):
+        from semlaflow.tmd import neuron_tmd_dim
+
         sample_mol = dm.train_dataset[0]
         if getattr(sample_mol, "_tmd", None) is None:
             raise ValueError(
@@ -115,7 +117,31 @@ def build_model(args, dm, vocab):
             )
         tmd_dim = int(sample_mol.tmd.shape[0])
         tmd_hidden = args.tmd_hidden
-        print(f"TMD conditioning enabled: tmd_dim={tmd_dim}, tmd_hidden={tmd_hidden}")
+
+        # Record which filtrations built the vector, so sample_neurons.py can refuse a
+        # dataset whose descriptor means something different at the same width.
+        tmd_filtrations = getattr(sample_mol, "_tmd_filtrations", None)
+        if tmd_filtrations is None:
+            # Predates the provenance field. Warn but continue -- the vector is still usable,
+            # we just cannot check it downstream.
+            print(
+                "WARNING: this .smol records no TMD filtration provenance (written by an older "
+                "preprocess_neurons.py). Training will proceed, but sampling cannot verify that "
+                "the descriptor matches. Re-run preprocess_neurons.py to remove this warning."
+            )
+        else:
+            tmd_filtrations = tuple(tmd_filtrations)
+            expected = neuron_tmd_dim(tmd_filtrations)
+            if expected != tmd_dim:
+                raise ValueError(
+                    f"TMD vector width {tmd_dim} does not match its recorded filtrations "
+                    f"{list(tmd_filtrations)} (expected {expected}). The .smol is inconsistent; "
+                    "re-run preprocess_neurons.py with --compute_tmd."
+                )
+            hparams["tmd_filtrations"] = list(tmd_filtrations)
+
+        names = "unrecorded" if tmd_filtrations is None else ", ".join(tmd_filtrations)
+        print(f"TMD conditioning enabled: tmd_dim={tmd_dim} ({names}), tmd_hidden={tmd_hidden}")
 
     # Cell-class (neuron type) conditioning: a discrete per-graph label embedded like the actual
     # method (one_hot -> Linear). Orthogonal to TMD; both can be on at once.
@@ -268,6 +294,9 @@ def build_model(args, dm, vocab):
         extra_cfm_kwargs["per_cell_class_min_count"] = args.per_cell_class_min_count
         extra_cfm_kwargs["metric_report_level"] = args.metric_report_level
         extra_cfm_kwargs["selection_health_max"] = selection_health_max(args)
+        extra_cfm_kwargs["tmd_cond_eval"] = args.tmd_cond_eval
+        extra_cfm_kwargs["tmd_cond_every"] = args.tmd_cond_every
+        extra_cfm_kwargs["tmd_cond_max_pairs"] = args.tmd_cond_max_pairs
     fm_model = cfm_cls(
         egnn_gen,
         vocab,
@@ -586,6 +615,17 @@ def get_parser() -> argparse.ArgumentParser:
                              "Orthogonal to --tmd_conditioning.")
     parser.add_argument("--class_hidden", type=int, default=16,
                         help="Embedding dim for the cell-class conditioning (one_hot -> Linear).")
+    parser.add_argument("--tmd_cond_eval", action=argparse.BooleanOptionalAction, default=True,
+                        help="Log matched-pair TMD conditioning fidelity (val-tmd_cond-*). Ignored "
+                             "unless the model is TMD conditioned. These are the metrics that show "
+                             "the conditioning is being followed; mmd_tmd cannot, since the "
+                             "evaluation filtration is now also conditioned on.")
+    parser.add_argument("--tmd_cond_every", type=int, default=5,
+                        help="Run the matched-pair TMD evaluation every N validation epochs "
+                             "(a persim Wasserstein per pair per filtration is not cheap).")
+    parser.add_argument("--tmd_cond_max_pairs", type=int, default=64,
+                        help="Cap on the number of index-matched pairs scored per run of the "
+                             "matched-pair TMD evaluation.")
 
     # Training args
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)

@@ -355,10 +355,23 @@ generate a neuron whose topology matches a target descriptor. The feature is
 **optional and off by default** end-to-end.
 
 **The descriptor** (`semlaflow/tmd/`): `compute_neuron_tmd(mol)` builds a rooted
-networkx tree (root = soma at node 0) and computes a **persistence image** using
-the rotation-invariant path-length-from-root filtration — default 16×16 =
-**256-dim** vector. Degenerate/non-tree graphs yield a zero vector, so no sample
-ever crashes the pipeline.
+networkx tree (root = soma at node 0) and computes one **persistence image** per
+filtration, concatenated. The default set is `("path", "radial_root")` — geodesic
+distance from the soma and straight-line distance from the soma — at 16×16 each,
+so **512-dim**. Degenerate/non-tree graphs yield a zero vector, so no sample ever
+crashes the pipeline.
+
+**Only rotation-invariant filtrations are selectable.** `compute_tmd_mixed` also
+implements `height` and `rho`, but both are defined against a fixed anatomical
+axis, and `neuron_mol_transform` applies a random 3D rotation every epoch while
+the descriptor is computed once at preprocess time — so their axis information
+cannot be resolved by an E(3)-equivariant model. `preprocess_neurons.py` rejects
+them. See COMPATIBLE.md §4.15.
+
+**Provenance is recorded.** Two filtration sets of the same size produce
+indistinguishable vectors, so the `.smol` also carries a `_tmd_filtrations` slot
+and the checkpoint records `tmd_filtrations` in hparams. `sample_neurons.py`
+refuses to run when the two disagree.
 
 The vector is a *global* per-graph feature. In the model
 (`SemlaGenerator`), when `tmd_hidden > 0` a small MLP (`Linear → SiLU →
@@ -376,13 +389,14 @@ python -m semlaflow.preprocess_neurons \
     --input_dir  /path/to/neurons_final \
     --output_dir /path/to/neurons_final/smol \
     --compute_tmd \
-    --tmd_filtrations path
+    --tmd_filtrations path radial_root
 ```
 
-- `--tmd_filtrations` accepts `path` (default, rotation-invariant), `height`,
-  `rho`, or a space-separated combination. Each filtration adds a
-  16×16 = 256-dim block to the vector.
-- The script prints the resulting `TMD vector dim`.
+- `--tmd_filtrations` accepts `path`, `radial_root`, or both (the default). Each
+  adds a 16×16 = 256-dim block, so the default is 512-dim. Duplicates and the
+  axis-dependent `height`/`rho` are rejected.
+- The script prints the resulting `TMD vector dim` and the filtration names, and
+  stamps the names onto every mol for the downstream provenance check.
 - Without `--compute_tmd`, the output `.smol` is byte-identical to the
   unconditional one.
 
@@ -397,9 +411,14 @@ python -m semlaflow.train \
 ```
 
 - `tmd_dim` is inferred from the training data; training raises a clear error if
-  the `.smol` has no TMD vectors (re-run preprocessing with `--compute_tmd`).
-- `tmd_dim` / `tmd_hidden` are saved into the checkpoint hparams, so the
-  conditioning MLP is reconstructed automatically on load.
+  the `.smol` has no TMD vectors (re-run preprocessing with `--compute_tmd`), or
+  if its width disagrees with its recorded filtrations.
+- `tmd_dim` / `tmd_hidden` / `tmd_filtrations` are saved into the checkpoint
+  hparams, so the conditioning MLP is reconstructed automatically on load and the
+  descriptor can be verified at sampling time.
+- Every `--tmd_cond_every` epochs (default 5), a matched-pair fidelity block is
+  logged as `val-tmd_cond-*`, capped at `--tmd_cond_max_pairs` pairs (default 64).
+  `--no-tmd_cond_eval` turns it off. It is skipped entirely on an unconditional run.
 
 ### 4c. Sample with conditioning
 
@@ -417,7 +436,32 @@ guards (all fatal):
 - checkpoint is conditional (`tmd_dim > 0`) but `--tmd_cond` was not passed;
 - `--tmd_cond` passed but the checkpoint is unconditional;
 - `--tmd_cond` passed but the `.smol` has no TMD vectors (re-run preprocessing
-  with `--compute_tmd`).
+  with `--compute_tmd`);
+- the checkpoint's `tmd_filtrations` disagree with the dataset's. Both sets are
+  the same width, so nothing else would catch this.
+
+`metrics.json` gains a `"tmd_cond"` block: matched-pair fidelity of each sample
+against the specific GT graph that conditioned it (`--tmd_cond_max_pairs`, default
+256). Unlike `mmd_tmd`, it cannot be satisfied by population-level mimicry — see
+COMPATIBLE.md §4.14.
+
+### 4d. Reading the metrics on a conditioned run
+
+`mmd_tmd` and `tmd_barlen_w1` use `radial_root`, which is now also conditioned on,
+so on a conditioned run they partly measure the model echoing its own input. Treat
+them as consistency checks and use the `tmd_cond` / `val-tmd_cond-*` block as the
+evidence that conditioning is being followed. Key entries:
+
+| key | meaning |
+| --- | --- |
+| `pd_wasserstein_<filtration>_{mean,median}` | per-pair persistence-diagram distance — did the sample realise the barcode it was given? |
+| `{axial_extent,radial_span,total_extent}_absdiff_{mean,median}` | per-pair extent error, each graph in its own root→centroid frame |
+| `{branch_length,bifurcation_angle}_w1_pairwise_{mean,median}` | per-tree W1 against its own pair (per-pair analogue of the pooled `*_w1`) |
+| `pd_nan_frac_<filtration>` | fraction of pairs with no usable diagram — reads 1.0 if `persim` is missing |
+| `n_pairs`, `n_pairs_skipped` | pairs scored, and those whose generated graph had no usable diagram |
+
+PD distances need `persim`; without it they read `nan` (and `pd_nan_frac` reads
+1.0) while every other entry still computes.
 
 ---
 

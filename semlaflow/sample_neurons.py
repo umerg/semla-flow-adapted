@@ -254,7 +254,8 @@ def _add_per_class_metrics(metrics, gen_graphs, gen_classes, gt_graphs, gt_mols,
 
 def evaluate_samples(args, gen_mols: list[GeometricMol], save_dir: Path,
                      gen_classes: list[int] | None = None,
-                     timing: dict | None = None, dataset: str | None = None) -> None:
+                     timing: dict | None = None, dataset: str | None = None,
+                     paired_gt_mols: list[GeometricMol] | None = None) -> None:
     """Compare generated graphs against the ground-truth split: distribution metrics
     (Wasserstein-1 per structural stat) written to metrics.json + printed, and
     multi-azimuth plot grids of generated and GT samples saved as PNGs.
@@ -316,6 +317,32 @@ def evaluate_samples(args, gen_mols: list[GeometricMol], save_dir: Path,
             compute_distribution_metrics, args.per_cell_class_min_count,
             dataset=dataset, gt_cache=gt_cache, subset_fn=subset_gt_cache,
         )
+
+    # Matched-pair TMD conditioning fidelity. The distribution metrics above cannot show
+    # the conditioning is followed -- their filtration is one the model trained on. These
+    # pair each sample with the specific GT graph whose descriptor produced it.
+    if paired_gt_mols:
+        from semlaflow.validation.tmd_conditional_eval import (
+            compute_conditional_pairwise_metrics,
+        )
+
+        n_pairs = min(len(gen_mols), len(paired_gt_mols))
+        if n_pairs < len(gen_mols):
+            print(f"[eval] TMD pairing covers {n_pairs}/{len(gen_mols)} samples")
+        # paired_gt_mols come off the dataloader in transformed units (the training
+        # transform divides by coord_std); scale them back to microns so both sides of
+        # every pair are in the same units as the generated graphs.
+        coord_std = util.get_dataset_config(dataset).coord_std if dataset else 1.0
+        paired_gt_graphs = [
+            geometric_mol_to_nx(m, coord_scale=coord_std) for m in paired_gt_mols[:n_pairs]
+        ]
+        metrics["tmd_cond"] = compute_conditional_pairwise_metrics(
+            gen_graphs[:n_pairs], paired_gt_graphs, max_pairs=args.tmd_cond_max_pairs,
+        )
+        print(f"\n[eval] matched-pair TMD conditioning fidelity "
+              f"(n={int(metrics['tmd_cond'].get('n_pairs', 0))})")
+        for key in sorted(metrics["tmd_cond"]):
+            print(f"{key:<40}{metrics['tmd_cond'][key]:.4f}")
 
     if timing is not None:
         metrics.update(timing)
@@ -389,7 +416,40 @@ def main(args):
                 "--tmd_cond requires TMD vectors in the dataset, but none were found. "
                 "Re-run preprocess_neurons.py with --compute_tmd to regenerate the .smol."
             )
-        print("TMD conditioning ON: conditioning on paired val-graph TMD vectors.")
+
+        # Width alone does not identify a descriptor: two different filtration sets of the
+        # same size load fine and produce a plausible-looking but meaningless run. Compare
+        # the names the checkpoint trained on against the ones this .smol was built with.
+        ckpt_filtrations = model.hparams.get("tmd_filtrations")
+        data_filtrations = getattr(sample_mol, "_tmd_filtrations", None)
+        if ckpt_filtrations is not None and data_filtrations is not None:
+            if tuple(ckpt_filtrations) != tuple(data_filtrations):
+                from semlaflow.tmd import neuron_tmd_dim
+
+                ckpt_dim = neuron_tmd_dim(ckpt_filtrations)
+                data_dim = int(sample_mol.tmd.shape[0])
+                # Only the equal-width case is the silent one worth calling out; a width
+                # mismatch would also surface as a shape error in tmd_proj.
+                detail = (
+                    f"Both are {data_dim}-dim, so nothing else would catch this."
+                    if ckpt_dim == data_dim
+                    else f"Widths differ ({ckpt_dim} vs {data_dim})."
+                )
+                raise SystemExit(
+                    "TMD filtration mismatch. This checkpoint was trained on "
+                    f"[{', '.join(ckpt_filtrations)}] but the dataset's vectors were built from "
+                    f"[{', '.join(data_filtrations)}]. {detail} Re-run preprocess_neurons.py "
+                    f"with --tmd_filtrations {' '.join(ckpt_filtrations)}."
+                )
+        else:
+            missing = "checkpoint" if ckpt_filtrations is None else "dataset"
+            print(
+                f"WARNING: the {missing} records no TMD filtration provenance, so the descriptor "
+                "cannot be verified. Re-run preprocess_neurons.py (and retrain) to enable the check."
+            )
+
+        names = ", ".join(data_filtrations) if data_filtrations else "unrecorded"
+        print(f"TMD conditioning ON ({names}): conditioning on paired val-graph TMD vectors.")
 
     # Cell-class (neuron type) conditioning guards: keep ckpt and CLI flag consistent.
     ckpt_class_conditional = getattr(model.gen, "class_hidden", 0) > 0
@@ -421,6 +481,11 @@ def main(args):
     test_dl = dm.test_dataloader()
     all_mols: list[GeometricMol] = []
     gen_classes: list[int] = []  # conditioning class per emitted sample (type-conditioned runs)
+    # The specific GT graph each sample was conditioned on (TMD-conditioned runs). It cannot
+    # be recovered after the loop: `build_dm` resamples the split with replacement, so
+    # gt_mols[i] is NOT the pair of all_mols[i]. batch[1] is the `data` dict built from the
+    # same mols as the prior, so it is the only correct source for the pairing.
+    paired_gt_mols: list[GeometricMol] = []
     raw_batches: list[dict] = []
     sampling_seconds_total = 0.0  # wall-clock spent inside _generate (the ODE rollout only)
     n_sampled = 0                 # graphs the ODE integrated (rows fed to _generate)
@@ -439,6 +504,12 @@ def main(args):
         n_sampled += prior["coords"].size(0)
         batch_mols = samples_to_mols(output, edge_class_index=NEURON_EDGE_CLASS_INDEX)
         all_mols.extend(batch_mols)
+        if args.tmd_cond and "tmd" in prior:
+            # Same mask, so samples_to_mols drops the same rows on both sides and the two
+            # lists stay 1:1. Still in transformed units -- rescaled at eval time.
+            paired_gt_mols.extend(
+                samples_to_mols(batch[1], edge_class_index=NEURON_EDGE_CLASS_INDEX)
+            )
         if args.type_cond and "cell_class" in prior:
             # samples_to_mols drops all-masked (empty) graphs; align the class labels the same way
             # so gen_classes stays 1:1 with all_mols. Each sample's class == the paired prior's class.
@@ -481,7 +552,8 @@ def main(args):
         print("Evaluating samples (structural metrics + plots)...")
         evaluate_samples(args, all_mols, save_dir,
                          gen_classes=gen_classes if args.type_cond else None, timing=timing,
-                         dataset=dataset)
+                         dataset=dataset,
+                         paired_gt_mols=paired_gt_mols if args.tmd_cond else None)
 
     print("Done.")
 
@@ -520,6 +592,9 @@ if __name__ == "__main__":
                         help="Skip post-sampling structural metrics + plots (pure sampling only).")
     parser.add_argument("--n_plot_examples", type=int, default=DEFAULT_N_PLOT_EXAMPLES,
                         help="Number of generated/GT samples per multi-azimuth plot grid.")
+    parser.add_argument("--tmd_cond_max_pairs", type=int, default=256,
+                        help="Cap on index-matched pairs scored by the matched-pair TMD evaluation "
+                             "(--tmd_cond runs only). A persim Wasserstein per pair per filtration.")
     parser.add_argument("--per_cell_class_min_count", type=int, default=20,
                         help="Per-class stratified metrics (with --type_cond): skip classes with "
                              "fewer than this many generated or GT graphs.")
