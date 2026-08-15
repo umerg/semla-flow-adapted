@@ -98,11 +98,11 @@ original flags are in the git history of this file.
    [§4](#4-memory-what-to-do-when-it-ooms).
 4. **`--batch_cost`** is a memory budget, not a batch size: peak pairs ≈
    `256 × batch_cost`. Once checkpointing frees up headroom you can afford a much
-   larger budget, which is where the throughput comes back. It has a **second, non-obvious
-   effect**: it sets each bucket's batch size, and a bucket holding fewer graphs than that can
-   produce zero batches and be dropped from training entirely. Do not raise it past the value
-   this file gives for a corpus without re-checking — see
-   [§3a](#--batch_cost-silently-excludes-small-graphs).
+   larger budget, which is where the throughput comes back. It also sets each bucket's batch
+   size, which used to mean that raising it could drop under-full buckets from training
+   entirely; that is fixed (`drop_last=False` on the train loader), but it is still the knob
+   that decides how ragged the last batch of each bucket is — see
+   [§3a](#--batch_cost-used-to-silently-exclude-small-graphs-fixed-2026-08-15).
 
 ---
 
@@ -360,57 +360,66 @@ bit-identical), so keeping it is a strict win. What the cap buys d20 is 43% of t
 real headroom — not one fewer flag. d15_capped is different: its largest graph is 12.6 GB in bf16
 (25.3 GB even in fp32), so checkpointing is pure overhead there.
 
-### `--batch_cost` silently excludes small graphs
+### `--batch_cost` used to silently exclude small graphs (fixed 2026-08-15)
 
-`train_dataloader` uses `drop_last=True` (`data/datamodules.py:79`) and `BucketBatchSampler`
-computes `n_batches = len(bucket) // batch_size` (`data/util.py:48`). **A bucket holding fewer items
-than its own batch size yields zero batches**, and `__iter__` draws buckets with
-`random.choices(weights=remaining_batches)` — so a zero-weight bucket is never drawn and those
-graphs are *never trained on, in any epoch*. This is distinct from the ordinary `drop_last`
-remainder, which re-randomises every epoch and costs nothing in the long run.
+**Fixed at the source — `train_dataloader` now passes `drop_last=False`
+(`data/datamodules.py:79`).** All corpora are at 100% train coverage per epoch, verified by
+iterating the real `BucketBatchSampler` and taking the union of emitted indices. Read this section
+for what it means for runs made *before* that date.
 
-On the **uncapped** `trees_genus_d20` at the `--batch_cost 16384` prescribed in §3, the six lowest
-buckets of `_SWC_BUCKET_PREFIX` all go to zero: **363 of 2,695 train graphs (13.5%) — everything
-under ~128 nodes — never enter training.**
+The defect: with `drop_last=True`, `BucketBatchSampler` computes
+`n_batches = len(bucket) // batch_size` (`data/util.py:48`), so **a bucket holding fewer graphs than
+its own batch size yields zero batches**. `__iter__` draws buckets with
+`random.choices(weights=remaining_batches)`, so a zero-weight bucket is never drawn and its graphs
+never enter training *in any epoch*. Because a bucket's batch size is set by `--batch_cost`, raising
+that knob quietly shrank the corpus. On the uncapped `trees_genus_d20` at the `--batch_cost 16384`
+prescribed in §3, the six lowest buckets of `_SWC_BUCKET_PREFIX` all went to zero: **363 of 2,695
+train graphs (13.5%) — everything under ~128 nodes.**
 
-**This affects training only.** `val_dataloader` / `test_dataloader` pass `drop_last=False`, which
-turns a short bucket into one batch of `len(bucket)` rather than none, so validation and
-`sample_neurons.py` (which uses `test_dataloader()`, `sample_neurons.py:486`) see every graph — the
-`DEFAULT_BATCH_COST = 8192` on the sampling scripts is harmless.
+This never affected validation or sampling: `val_dataloader` / `test_dataloader` already passed
+`drop_last=False`, so `sample_neurons.py` (which uses `test_dataloader()`, `:486`) always saw every
+graph, and its `DEFAULT_BATCH_COST = 8192` was always harmless.
 
-Permanently-excluded fraction of the **train** split, measured from each corpus's own `train.smol`
-against its registered `bucket_limits`:
+Train-split coverage per epoch, measured by iterating the sampler:
 
-| dataset | 1024 (default) | 2048 | 4096 | 8192 | 16384 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `neurons` | 0.02% | 0.02% | 0.12% | 11.29% | 11.29% |
-| `neurons_conditional` | **0.00%** | 1.97% | 2.01% | 2.01% | 2.45% |
-| `trees_genus_d10` | **0.00%** | **0.00%** | 0.22% | 1.04% | 1.04% |
-| `trees_genus_d15` | 2.23% | 6.86% | 12.91% | 12.91% | 22.26% |
-| `trees_genus_d20` | 3.38% | 3.38% | 7.20% | 7.20% | 13.47% |
-| `trees_genus_d10_capped` | **0.00%** | 0.08% | 0.08% | 1.18% | 4.53% |
-| `trees_genus_d15_capped` | **0.00%** | **0.00%** | **0.00%** | **0.00%** | **0.00%** |
-| `trees_genus_d20_capped` | **0.00%** | **0.00%** | **0.00%** | **0.00%** | **0.00%** |
+| dataset | `--batch_cost` | before (`drop_last=True`) | now |
+| --- | ---: | ---: | ---: |
+| `neurons_conditional_full` | 1024 | 22,528 / 22,773 (98.9%) | **100%** |
+| `trees_genus_d10` | 1024 | 2,684 / 2,695 (99.6%) | **100%** |
+| `trees_genus_d10_capped` | 1024 | 2,514 / 2,538 (99.1%) | **100%** |
+| `trees_genus_d15_capped` | 2048 | 2,503 / 2,538 (98.6%) | **100%** |
+| `trees_genus_d20_capped` | 16384 | 2,365 / 2,538 (93.2%) | **100%** |
+| `trees_genus_d15` | 1024 | 2,536 / 2,695 (94.1%) | **100%** |
+| `trees_genus_d20` | 16384 | 2,208 / 2,695 (81.9%) | **100%** |
 
-Every corpus is at 0.00% **at the `--batch_cost` this file prescribes for it**. The fix is the
-bucket ladder, not the sampler: the capped entries and `trees_genus_d10` use coarse low ends
-(`[96, 128, …]`, `[128, 200, …]`, `[160, 200, …]`) sized so every bucket clears its own batch size.
-`_SWC_BUCKET_PREFIX`'s fine low end is right for the neuron corpora — 22,740 train graphs spread
-over it, so no bucket starves at `batch_cost` 1024 — and wrong for the ~2,700-graph tree corpora.
-`trees_genus_d10` was changed to a coarse ladder on 2026-08-15; **runs on it before that date
-trained on 2,606 of 2,695 graphs**, having silently dropped the 89 graphs of ≤24 nodes.
+Two distinct losses hid behind the one flag, and only the second was serious. The **remainder**
+(`len(bucket) % batch_size`) was benign: `RandomSampler` reshuffles each epoch, so a different
+random subset was skipped each time and the chance a graph was never seen over 300 epochs was
+~0 (worst case `0.188³⁰⁰`). Its only real cost was that an "epoch" ran 0.4–6.8% short of a full
+pass, which matters when epochs are a budget-parity unit. The **zero-batch buckets** were permanent.
 
-Two things this does **not** cover:
+Consequences for existing results, in decreasing order of severity:
 
-- `trees_genus_d15` / `trees_genus_d20` (uncapped) still carry the prefix ladder and are still
-  lossy at every `batch_cost`. They are superseded by the capped corpora and were left alone rather
-  than silently changing a corpus that may have published runs against it. If you train them, treat
-  the numbers above as the size of the effective corpus.
-- The sampler itself. `BucketBatchSampler` is shared with the molecular datasets, so making an
-  under-full bucket yield one short batch instead of none belongs in its own change.
+- **Uncapped `trees_genus_d20` at `--batch_cost 16384`: 13.5% of the train split (363 graphs)
+  permanently never seen**, plus a further ~4.6% skipped per epoch as re-randomising remainder —
+  the 81.9% coverage above is the two combined. Uncapped `d15` at the default: 2.2% permanent.
+- `trees_genus_d10` also had its ladder coarsened on 2026-08-15 (it had 89 graphs of ≤24 nodes in a
+  bucket that starved at the default `batch_cost`). Between the ladder change and this one, runs on
+  it before that date trained on 2,606 of 2,695 graphs.
+- Everything else was ≥98.6% and re-randomising, i.e. statistically indistinguishable from full.
 
-When in doubt, read the `items per bucket / bucket batch sizes / batches per bucket` line the
-sampler prints at startup: **any bucket with a non-zero item count and 0 batches is a silent loss.**
+The coarse bucket ladders on the capped corpora and `trees_genus_d10` (`[96, 128, …]`,
+`[128, 200, …]`, `[160, 200, …]`) are **no longer load-bearing for correctness** — `drop_last=False`
+alone guarantees full coverage. They are kept because they still batch small graphs better than
+`_SWC_BUCKET_PREFIX`'s fine low end does on a ~2,500-graph corpus.
+
+`drop_last=True` came in with the original upstream SemlaFlow import (`d2193e9`), where it is
+standard and harmless: on ~300k-molecule sets no bucket can starve. It was flipped here because
+this repo trains only SWC corpora. If you ever train `qm9` / `geom-drugs` from this tree, note the
+train loader now emits one short batch per bucket per epoch.
+
+The startup line `items per bucket / bucket batch sizes / batches per bucket` is still the fastest
+check: **every bucket with a non-zero item count must now show ≥1 batch.**
 
 ### Commands
 

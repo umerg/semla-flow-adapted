@@ -94,9 +94,9 @@ DATASET_CONFIGS: dict[str, DatasetConfig] = {
     # a 256 cap discards. 22773/2529/1167 train/val/test. All 7 cell classes clear
     # --per_cell_class_min_count 20 in val (866/642/336/65/28/353/239), unlike the tree corpora.
     #
-    # The 24-node bucket of _SWC_BUCKET_PREFIX is folded into 40 here: with 22773 train graphs the
-    # prefix is safe at --batch_cost 1024, but the merge also holds zero-batch loss at 0.0% for
-    # 2048 (RUN.md section 3a). Peak is 18.2 GB fp32 at --batch_cost 1024 -- *lower* than
+    # The 24-node bucket of _SWC_BUCKET_PREFIX is folded into 40 here: only 444 of the 22773 train
+    # graphs land below 24 nodes, so the separate bucket bought little and starved at any
+    # --batch_cost above 1024. Peak is 18.2 GB fp32 at --batch_cost 1024 -- *lower* than
     # neurons_conditional's 22.9 GB, because folding 224 into 256 removes the bucket that set it.
     "neurons_conditional_full": DatasetConfig(
         coord_std=66.1040,
@@ -113,10 +113,12 @@ DATASET_CONFIGS: dict[str, DatasetConfig] = {
     # max 242), and SemlaFlow's activation memory is O(N^2) at ~57 KB per node-pair in fp32.
     # Training d15/d20 therefore needs `--precision bf16-mixed --grad_checkpointing`; see the
     # memory table in NEURONS.md section 6.
-    # NOTE d10's ladder does not use _SWC_BUCKET_PREFIX. With the prefix's 24-node bucket (89 of
-    # 2695 train graphs) the sampler gave it batch size 312 at the default --batch_cost 1024, so
-    # `len(bucket) // batch_size` was 0 and those 89 graphs were never sampled -- see RUN.md 3a.
-    # The coarse low end below holds that loss at 0.0% for --batch_cost 1024 and 2048.
+    # NOTE d10's ladder does not use _SWC_BUCKET_PREFIX. The prefix's 24-node bucket holds 89 of
+    # its 2695 train graphs, far fewer than the batch size 312 the sampler gives that bucket at
+    # the default --batch_cost 1024, so it batches them poorly. It used to be worse than poor:
+    # under the old drop_last=True those 89 graphs were never sampled at all (RUN.md 3a). That
+    # is fixed in data/datamodules.py, so this ladder is now about batching quality, not
+    # correctness.
     "trees_genus_d10": DatasetConfig(
         coord_std=1.6417,
         bucket_limits=[96, 128, 160, 200, 256, 320, 384],
@@ -154,9 +156,10 @@ DATASET_CONFIGS: dict[str, DatasetConfig] = {
     # the rule and these constants. Flags and caveats: RUN.md section 3a.
     #
     # These three deliberately do NOT use _SWC_BUCKET_PREFIX: its fine low end is right for the
-    # neuron corpora but starves the low buckets here, and a bucket holding fewer items than its
-    # own batch size yields zero batches and is never sampled (RUN.md section 3a). The coarse low
-    # ends below keep that loss at 0.0% for every batch_cost from 1024 to 16384.
+    # neuron corpora but starves the low buckets on a ~2.5k-graph corpus, leaving buckets holding
+    # fewer graphs than their own batch size. That is now only a batching-efficiency issue --
+    # train_dataloader passes drop_last=False, so an under-full bucket emits one short batch
+    # rather than being skipped entirely as it was before 2026-08-15 (RUN.md section 3a).
     "trees_genus_d10_capped": DatasetConfig(
         coord_std=1.6346,
         bucket_limits=[96, 128, 160, 200, 240, 268],
