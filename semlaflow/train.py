@@ -477,8 +477,15 @@ def build_trainer(args):
 
     # Construct the logger only when it will actually be used: a trial run discards it
     # below, and building it eagerly makes `--trial_run` require wandb to be installed.
+    # log_model defaults to False: checkpoints are written to the local filesystem by the
+    # ModelCheckpoint callbacks below either way, and uploading them to W&B as artifacts is pure
+    # extra cost. It is not a small one -- the `snap-` callback runs with save_top_k=-1, and
+    # Lightning's WandbLogger.after_save_checkpoint uploads *every* save of a save_top_k=-1
+    # callback during training (loggers/wandb.py: `log_model == "all" or log_model is True and
+    # checkpoint_callback.save_top_k == -1`). At the defaults that is 30 weights-only snapshots
+    # of ~175 MB plus the two full end-of-run checkpoints, i.e. ~6 GB uploaded per run.
     logger = None if args.trial_run else WandbLogger(
-        project=project_name, save_dir="wandb", log_model=True
+        project=project_name, save_dir="wandb", log_model=args.wandb_log_model
     )
 
     # Make `epoch` the default x-axis for every panel.
@@ -715,6 +722,14 @@ def get_parser() -> argparse.ArgumentParser:
         help="How many monitored checkpoints to keep (per monitor). The full-precision "
              "checkpoints are ~437 MB each, so raising this costs real disk. Independent "
              "of the weights-only 'snap-' snapshots, which always keep every validation."
+    )
+    parser.add_argument(
+        "--wandb_log_model", action="store_true",
+        help="Also upload checkpoints to W&B as artifacts. OFF by default: checkpoints are "
+             "always written locally under wandb/<project>/<run-id>/checkpoints/ regardless, "
+             "and the upload is ~6 GB per run at the defaults (every 'snap-' snapshot goes up "
+             "during training, because that callback uses save_top_k=-1). Turn it on only if "
+             "you need to pull checkpoints from the W&B UI rather than the training filesystem."
     )
     for _key, _flag in SELECTION_HEALTH_FLAGS.items():
         parser.add_argument(

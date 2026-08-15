@@ -620,6 +620,28 @@ kept). So **both selection criteria come out of one run** with no extra flags �
 them at the end. `--save_top_k` (default 1) raises how many of the two full-checkpoint
 families are kept; at ~437 MB each, mind the disk.
 
+**Where they go, and why they are not uploaded to W&B.** The `ModelCheckpoint` callbacks set no
+`dirpath` and the Trainer sets no `default_root_dir`, so Lightning derives the location from the
+logger: **`wandb/equinv-<dataset>/<run-id>/checkpoints/`**, relative to the working directory the
+run was launched from. That happens whether or not W&B is involved — the files are always local.
+
+`WandbLogger(log_model=...)` controls only the *additional* upload of those files as W&B artifacts,
+and it is now **off by default** (`--wandb_log_model` turns it on). It used to be `True`, which is
+expensive here for a non-obvious reason: `after_save_checkpoint` in Lightning's
+`loggers/wandb.py` uploads on every save when a callback has `save_top_k == -1` —
+
+```python
+if self._log_model == "all" or self._log_model is True and checkpoint_callback.save_top_k == -1:
+    self._scan_and_log_checkpoints(checkpoint_callback)
+```
+
+— and the `snap-` callback is exactly that. So at the defaults (300 epochs, `--val_check_epochs 10`)
+every one of the 30 weights-only snapshots went up during training, ~175 MB each, plus the two full
+checkpoints at the end: **~6 GB per run**. Nothing is lost by leaving it off except being able to
+pull a checkpoint from the W&B UI instead of the training filesystem; metrics, curves and sample
+images are unaffected. Note there is no middle setting — turning it on re-enables the per-snapshot
+upload too, because that is a property of the `snap-` callback rather than of the flag.
+
 **Making morphology the primary criterion.** Add `--ckpt_monitor val-morpho-selection`
 *plus at least one ceiling*, e.g. `--selection_max_disconnected_frac 0.05`. Without a
 ceiling the gate never fires and you are selecting on raw `mmd_morpho`, which is blind to
