@@ -88,6 +88,23 @@ DATASET_CONFIGS: dict[str, DatasetConfig] = {
         class_names=NEURON_CELL_CLASS_NAMES,
         source="/Users/umer/Documents/neurons_conditional",
     ),
+    # The neuron corpus of record. A strict superset of neurons_conditional: the same 26445 graphs
+    # with identical split assignment plus 24 more (23 train, 1 val), and no cap applied at build
+    # time -- max N is 537 against neurons_conditional's 242, so it also keeps the 33 train graphs
+    # a 256 cap discards. 22773/2529/1167 train/val/test. All 7 cell classes clear
+    # --per_cell_class_min_count 20 in val (866/642/336/65/28/353/239), unlike the tree corpora.
+    #
+    # The 24-node bucket of _SWC_BUCKET_PREFIX is folded into 40 here: with 22773 train graphs the
+    # prefix is safe at --batch_cost 1024, but the merge also holds zero-batch loss at 0.0% for
+    # 2048 (RUN.md section 3a). Peak is 18.2 GB fp32 at --batch_cost 1024 -- *lower* than
+    # neurons_conditional's 22.9 GB, because folding 224 into 256 removes the bucket that set it.
+    "neurons_conditional_full": DatasetConfig(
+        coord_std=66.1040,
+        bucket_limits=[40, 56, 72, 96, 128, 160, 200, 256, 537],
+        max_nodes=537,
+        class_names=NEURON_CELL_CLASS_NAMES,
+        source="/Users/umer/Documents/neurons_conditional_full",
+    ),
     # Botanical-tree corpora: the same 3368 QSM reconstructions binarized to three depth caps.
     # Base-rooted, binarized, `# cell_class N` genus headers, coords in METRES (not microns).
     # All three keep 100% of their graphs at these caps -- nothing is dropped.
@@ -96,9 +113,13 @@ DATASET_CONFIGS: dict[str, DatasetConfig] = {
     # max 242), and SemlaFlow's activation memory is O(N^2) at ~57 KB per node-pair in fp32.
     # Training d15/d20 therefore needs `--precision bf16-mixed --grad_checkpointing`; see the
     # memory table in NEURONS.md section 6.
+    # NOTE d10's ladder does not use _SWC_BUCKET_PREFIX. With the prefix's 24-node bucket (89 of
+    # 2695 train graphs) the sampler gave it batch size 312 at the default --batch_cost 1024, so
+    # `len(bucket) // batch_size` was 0 and those 89 graphs were never sampled -- see RUN.md 3a.
+    # The coarse low end below holds that loss at 0.0% for --batch_cost 1024 and 2048.
     "trees_genus_d10": DatasetConfig(
         coord_std=1.6417,
-        bucket_limits=_SWC_BUCKET_PREFIX + [256, 320, 384],
+        bucket_limits=[96, 128, 160, 200, 256, 320, 384],
         max_nodes=384,
         class_names=TREE_GENUS_NAMES,
         units="m",
@@ -119,6 +140,46 @@ DATASET_CONFIGS: dict[str, DatasetConfig] = {
         class_names=TREE_GENUS_NAMES,
         units="m",
         source="/Users/umer/Documents/trees_genus_d20",
+    ),
+    # Node-capped, sample-matched duplicates of the three tree corpora. The 199 trees whose *d20*
+    # node count exceeds 1110 are dropped from ALL THREE depths, so d10/d15/d20 hold the same 3169
+    # graphs (2538/316/315) and a cross-depth comparison stays a depth ablation rather than a
+    # depth-plus-composition one. That one shared rule bounds d15 at 666 and d10 at 268 because
+    # d15's own tail above 785 is a strict subset of d20's above 1110.
+    #
+    # The tail is 96% Fagus, so the cap *lowers* the class imbalance (88.18% -> 87.66%) and costs
+    # no rare-genus validation tree; it buys back 25/37/43% of the O(N^2) epoch cost and real 40 GB
+    # headroom at d20. Built by dendrite_gen/preprocessing/make_capped_tree_corpora.py from the
+    # uncapped corpora, which are left untouched; each corpus carries a BUILD_MANIFEST.json with
+    # the rule and these constants. Flags and caveats: RUN.md section 3a.
+    #
+    # These three deliberately do NOT use _SWC_BUCKET_PREFIX: its fine low end is right for the
+    # neuron corpora but starves the low buckets here, and a bucket holding fewer items than its
+    # own batch size yields zero batches and is never sampled (RUN.md section 3a). The coarse low
+    # ends below keep that loss at 0.0% for every batch_cost from 1024 to 16384.
+    "trees_genus_d10_capped": DatasetConfig(
+        coord_std=1.6346,
+        bucket_limits=[96, 128, 160, 200, 240, 268],
+        max_nodes=268,
+        class_names=TREE_GENUS_NAMES,
+        units="m",
+        source="/Users/umer/Documents/trees_genus_d10_capped",
+    ),
+    "trees_genus_d15_capped": DatasetConfig(
+        coord_std=1.7935,
+        bucket_limits=[128, 200, 264, 336, 416, 512, 592, 666],
+        max_nodes=666,
+        class_names=TREE_GENUS_NAMES,
+        units="m",
+        source="/Users/umer/Documents/trees_genus_d15_capped",
+    ),
+    "trees_genus_d20_capped": DatasetConfig(
+        coord_std=1.9658,
+        bucket_limits=[160, 200, 264, 336, 424, 528, 648, 784, 928, 1110],
+        max_nodes=1110,
+        class_names=TREE_GENUS_NAMES,
+        units="m",
+        source="/Users/umer/Documents/trees_genus_d20_capped",
     ),
 }
 
