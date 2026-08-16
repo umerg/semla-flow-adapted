@@ -16,8 +16,62 @@ These rules are defined once here and reused by `dist_metrics` and `plot`.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import networkx as nx
 import numpy as np
+import torch
+
+from semlaflow.util.molrepr import GeometricMol
+
+
+def samples_to_mols(output, edge_class_index: int) -> list[GeometricMol]:
+    """Extract a list of GeometricMol from a raw `_generate` (or `data`) batch dict.
+
+    Skips the RDKit-based builder entirely. For each batch element:
+      * crop to real nodes via the mask,
+      * argmax over bond distributions (works on one-hot `data` tensors too),
+      * symmetrise (edge iff either direction's argmax equals edge_class),
+      * emit one GeometricMol with degenerate atomics and zero charges.
+    """
+    coords = output["coords"].detach().cpu()
+    atomics = output["atomics"].detach().cpu()
+    bond_dists = output["bonds"].detach().cpu()
+    masks = output["mask"].detach().cpu().bool()
+
+    bond_argmax = bond_dists.argmax(dim=-1)
+
+    mols: list[GeometricMol] = []
+    for b in range(coords.size(0)):
+        n_real = int(masks[b].sum().item())
+        if n_real == 0:
+            continue
+
+        coords_b = coords[b, :n_real].float()
+        atomics_b = atomics[b, :n_real].argmax(-1).long()
+        pair = bond_argmax[b, :n_real, :n_real]
+
+        edge = (pair == edge_class_index) | (pair.T == edge_class_index)
+        iu = torch.triu_indices(n_real, n_real, offset=1)
+        if iu.size(1) == 0:
+            bond_indices = torch.zeros((0, 2), dtype=torch.long)
+        else:
+            keep = edge[iu[0], iu[1]]
+            bond_indices = iu[:, keep].T.long()
+
+        bond_types = torch.full((bond_indices.size(0),), edge_class_index, dtype=torch.long)
+        charges = torch.zeros((n_real,), dtype=torch.long)
+
+        mols.append(
+            GeometricMol(
+                coords=coords_b,
+                atomics=atomics_b,
+                bond_indices=bond_indices,
+                bond_types=bond_types,
+                charges=charges,
+            )
+        )
+    return mols
 
 
 def _coords_array(mol, coord_scale: float = 1.0) -> np.ndarray:
@@ -28,8 +82,46 @@ def _coords_array(mol, coord_scale: float = 1.0) -> np.ndarray:
     return coords
 
 
+# Fraction of the principal-axis range treated as an "end band" when canonicalising the axis
+# sign. Tuned over all three trees_genus corpora (0.05-0.50 swept); 0.15 is the plateau.
+_END_BAND_FRAC = 0.15
+
+
+def _orient_axis(centred: np.ndarray, axis: np.ndarray) -> np.ndarray:
+    """Point `axis` from the sparse end of the point cloud towards the dense end.
+
+    `np.linalg.eigh` returns eigenvectors of arbitrary sign. That is harmless for the extent
+    metrics (they use the axis sign-invariantly) but it decides which end `pca_base_root`
+    calls the "base", so without canonicalisation the root is one of the two ends at random.
+
+    A tree is sparse at the trunk base and dense in the crown, so we compare how many points
+    fall in the outer band at each end and orient towards the denser one. Ties (tiny or
+    near-symmetric graphs) fall back to which end has the longer tail past the median. Both
+    tests are rotation-invariant, which is required because the training transform applies a
+    random rotation.
+    """
+    proj = centred @ axis
+    lo, hi = float(proj.min()), float(proj.max())
+    span = hi - lo
+    if span <= 0.0:
+        return axis
+
+    band = span * _END_BAND_FRAC
+    n_lo = int((proj <= lo + band).sum())
+    n_hi = int((proj >= hi - band).sum())
+    if n_lo != n_hi:
+        # Denser end is the crown; the axis should point towards it.
+        return axis if n_hi > n_lo else -axis
+
+    median = float(np.median(proj))
+    return axis if (median - lo) > (hi - median) else -axis
+
+
 def pca_axis(coords: np.ndarray) -> np.ndarray:
     """Unit principal axis (top eigenvector of the centred coord covariance).
+
+    Oriented sparse-end -> dense-end by `_orient_axis` so that the sign is reproducible
+    across graphs; see that function for why it matters.
 
     Falls back to +z for degenerate inputs (<2 points or zero variance).
     """
@@ -45,7 +137,7 @@ def pca_axis(coords: np.ndarray) -> np.ndarray:
     norm = float(np.linalg.norm(axis))
     if norm < 1e-12:
         return np.array([0.0, 0.0, 1.0])
-    return axis / norm
+    return _orient_axis(centred, axis / norm)
 
 
 def pca_base_root(coords: np.ndarray) -> int:
@@ -75,13 +167,14 @@ def choose_root(G: nx.Graph, coords: np.ndarray) -> int:
     return pca_base_root(coords)
 
 
-def geometric_mol_to_nx(mol, *, coord_scale: float = 1.0) -> nx.Graph:
+def geometric_mol_to_nx(mol, *, coord_scale: float = 1.0, root: Optional[int] = None) -> nx.Graph:
     """Build an undirected networkx graph from a GeometricMol.
 
     Node `i` carries `pos = coords[i] * coord_scale` (length-3 np.float64); edges come
-    from `mol.bond_indices`; `G.graph["root"]` is set via `choose_root`. Pass
-    `coord_scale=NEURON_COORDS_STD_DEV` for generated (standardised) mols to recover
-    physical microns; leave `coord_scale=1.0` for ground-truth mols (already physical).
+    from `mol.bond_indices`. `G.graph["root"]` is set to `root` if given, else chosen via
+    `choose_root`. Pass `coord_scale=NEURON_COORDS_STD_DEV` for generated (standardised)
+    mols to recover physical microns; leave `coord_scale=1.0` for ground-truth mols
+    (already physical). Pass `root=0` for neuron mols where index 0 is the soma (per swc.py).
     """
     coords = _coords_array(mol, coord_scale)
     n = coords.shape[0]
@@ -96,5 +189,5 @@ def geometric_mol_to_nx(mol, *, coord_scale: float = 1.0) -> nx.Graph:
             continue
         G.add_edge(int(a), int(b))
 
-    G.graph["root"] = choose_root(G, coords)
+    G.graph["root"] = int(root) if root is not None else choose_root(G, coords)
     return G

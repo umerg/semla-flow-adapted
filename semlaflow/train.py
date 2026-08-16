@@ -4,7 +4,7 @@ from pathlib import Path
 
 import lightning as L
 import torch
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 
 import semlaflow.scriptutil as util
@@ -44,7 +44,7 @@ DEFAULT_WARM_UP_STEPS = 10000
 DEFAULT_BUCKET_COST_SCALE = "quadratic"
 
 DEFAULT_N_VALIDATION_MOLS = 1800
-DEFAULT_VAL_CHECK_EPOCHS = 20
+DEFAULT_VAL_CHECK_EPOCHS = 10
 DEFAULT_NUM_INFERENCE_STEPS = 100
 DEFAULT_CAT_SAMPLING_NOISE_LEVEL = 1
 DEFAULT_COORD_NOISE_STD_DEV = 0.2
@@ -52,6 +52,37 @@ DEFAULT_TYPE_DIST_TEMP = 1.0
 DEFAULT_TIME_ALPHA = 2.0
 DEFAULT_TIME_BETA = 1.0
 DEFAULT_OPTIMAL_TRANSPORT = "equivariant"
+DEFAULT_PRECISION = "32"
+DEFAULT_METRIC_REPORT_LEVEL = "standard"
+DEFAULT_CKPT_MONITOR = "val-loss"
+
+# Health-fraction ceilings for the `val-morpho-selection` checkpoint monitor, keyed by the
+# metric name in `validation.dist_metrics`. Defaults are permissive (1.0 = never gates), so
+# turning on the morpho monitor changes nothing until a ceiling is set explicitly.
+#
+# The gate exists because sanitisation deliberately makes `mmd_morpho` blind to structural
+# failure -- it scores the repaired tree -- so a model emitting garbage that happens to
+# have a plausible minimum spanning tree would win on `mmd_morpho` alone.
+SELECTION_HEALTH_FLAGS = {
+    "disconnected_frac": "--selection_max_disconnected_frac",
+    "multifurcation_frac": "--selection_max_multifurcation_frac",
+    "cycle_frac": "--selection_max_cycle_frac",
+    "isolated_node_frac": "--selection_max_isolated_node_frac",
+}
+
+
+def selection_health_max(args) -> dict:
+    """Collect the `--selection_max_*_frac` ceilings into the dict NeuronCFM expects.
+
+    Ceilings of 1.0 are dropped: a fraction can never exceed 1.0, so keeping them would
+    only add noise to the saved hparams.
+    """
+    out = {}
+    for key, flag in SELECTION_HEALTH_FLAGS.items():
+        limit = getattr(args, flag.lstrip("-"), 1.0)
+        if limit is not None and limit < 1.0:
+            out[key] = float(limit)
+    return out
 
 
 def build_model(args, dm, vocab):
@@ -60,14 +91,96 @@ def build_model(args, dm, vocab):
         "epochs": args.epochs,
         "gradient_clip_val": args.gradient_clip_val,
         "dataset": args.dataset,
-        "precision": "32",
+        "precision": args.precision,
         "architecture": args.arch,
         **dm.hparams,
     }
 
+    # Per-dataset constants for the SWC (neuron/tree) pipeline; None for the molecular datasets.
+    cfg = util.DATASET_CONFIGS.get(args.dataset)
+
     # Add 1 for the time (0 <= t <= 1 for flow matching)
     n_atom_feats = vocab.size + 1
     n_bond_types = util.get_n_bond_types(args.categorical_strategy)
+
+    # TMD conditioning: infer the vector width from the (preprocessed) training data.
+    tmd_dim = 0
+    tmd_hidden = 0
+    if getattr(args, "tmd_conditioning", False):
+        from semlaflow.tmd import neuron_tmd_dim
+
+        sample_mol = dm.train_dataset[0]
+        if getattr(sample_mol, "_tmd", None) is None:
+            raise ValueError(
+                "--tmd_conditioning was set but the training data has no TMD vectors. "
+                "Re-run preprocess_neurons.py with --compute_tmd."
+            )
+        tmd_dim = int(sample_mol.tmd.shape[0])
+        tmd_hidden = args.tmd_hidden
+
+        # Record which filtrations built the vector, so sample_neurons.py can refuse a
+        # dataset whose descriptor means something different at the same width.
+        tmd_filtrations = getattr(sample_mol, "_tmd_filtrations", None)
+        if tmd_filtrations is None:
+            # Predates the provenance field. Warn but continue -- the vector is still usable,
+            # we just cannot check it downstream.
+            print(
+                "WARNING: this .smol records no TMD filtration provenance (written by an older "
+                "preprocess_neurons.py). Training will proceed, but sampling cannot verify that "
+                "the descriptor matches. Re-run preprocess_neurons.py to remove this warning."
+            )
+        else:
+            tmd_filtrations = tuple(tmd_filtrations)
+            expected = neuron_tmd_dim(tmd_filtrations)
+            if expected != tmd_dim:
+                raise ValueError(
+                    f"TMD vector width {tmd_dim} does not match its recorded filtrations "
+                    f"{list(tmd_filtrations)} (expected {expected}). The .smol is inconsistent; "
+                    "re-run preprocess_neurons.py with --compute_tmd."
+                )
+            hparams["tmd_filtrations"] = list(tmd_filtrations)
+
+        names = "unrecorded" if tmd_filtrations is None else ", ".join(tmd_filtrations)
+        print(f"TMD conditioning enabled: tmd_dim={tmd_dim} ({names}), tmd_hidden={tmd_hidden}")
+
+    # Cell-class (neuron type) conditioning: a discrete per-graph label embedded like the actual
+    # method (one_hot -> Linear). Orthogonal to TMD; both can be on at once.
+    n_classes = 0
+    class_hidden = 0
+    if getattr(args, "type_conditioning", False):
+        # Config check first: a dataset with no declared class_names can never be conditioned,
+        # which is a clearer failure than "your data has no labels".
+        if cfg is None or cfg.class_names is None:
+            conditionable = [n for n, c in util.DATASET_CONFIGS.items() if c.class_names]
+            raise ValueError(
+                f"--type_conditioning was set but dataset '{args.dataset}' declares no class_names "
+                f"in scriptutil.DATASET_CONFIGS. Class conditioning is defined for: "
+                f"{', '.join(conditionable)}."
+            )
+        sample_mol = dm.train_dataset[0]
+        if getattr(sample_mol, "_cell_class", None) is None:
+            raise ValueError(
+                "--type_conditioning was set but the training data has no cell_class labels. "
+                f"Preprocess a class-labelled corpus (SWCs with a `# cell_class N` header, "
+                f"e.g. {args.dataset})."
+            )
+        n_classes = cfg.n_classes
+        # An out-of-range id would otherwise surface as an opaque device-side assert from the
+        # one_hot in SemlaGenerator; 2.7k-23k mols is cheap to scan.
+        observed = {
+            int(m._cell_class) for m in dm.train_dataset if getattr(m, "_cell_class", None) is not None
+        }
+        if observed and max(observed) >= n_classes:
+            raise ValueError(
+                f"Dataset '{args.dataset}' declares {n_classes} classes but the training data "
+                f"contains class id {max(observed)}. Fix "
+                f"DATASET_CONFIGS['{args.dataset}'].class_names."
+            )
+        class_hidden = args.class_hidden
+        print(
+            f"Class conditioning enabled: n_classes={n_classes} "
+            f"({', '.join(cfg.class_names)}), class_hidden={class_hidden}"
+        )
 
     if args.arch == "semla":
         dynamics = EquiInvDynamics(
@@ -81,6 +194,7 @@ def build_model(args, dm, vocab):
             bond_refine=True,
             self_cond=args.self_condition,
             coord_norm=args.coord_norm,
+            grad_checkpointing=args.grad_checkpointing,
         )
         egnn_gen = SemlaGenerator(
             args.d_model,
@@ -92,6 +206,10 @@ def build_model(args, dm, vocab):
             self_cond=args.self_condition,
             size_emb=args.size_emb,
             max_atoms=args.max_atoms,
+            tmd_dim=tmd_dim,
+            tmd_hidden=tmd_hidden,
+            n_classes=n_classes,
+            class_hidden=class_hidden,
         )
 
     elif args.arch == "eqgat":
@@ -121,8 +239,8 @@ def build_model(args, dm, vocab):
         coord_scale = util.QM9_COORDS_STD_DEV
     elif args.dataset == "geom-drugs":
         coord_scale = util.GEOM_COORDS_STD_DEV
-    elif args.dataset == "neurons":
-        coord_scale = util.NEURON_COORDS_STD_DEV
+    elif cfg is not None:
+        coord_scale = cfg.coord_std
     else:
         raise ValueError(f"Unknown dataset {args.dataset}")
 
@@ -151,7 +269,7 @@ def build_model(args, dm, vocab):
 
     train_steps = util.calc_train_steps(dm, args.epochs, args.acc_batches)
     # Neurons have no SMILES — skip the RDKit novelty path entirely.
-    if args.trial_run or args.dataset == "neurons":
+    if args.trial_run or args.dataset in util.NEURON_DATASETS:
         train_smiles = None
     else:
         train_smiles = [mols.str_id for mols in dm.train_dataset]
@@ -167,7 +285,20 @@ def build_model(args, dm, vocab):
         bond_mask_index=bond_mask_index,
     )
 
-    cfm_cls = NeuronCFM if args.dataset == "neurons" else MolecularCFM
+    cfm_cls = NeuronCFM if args.dataset in util.NEURON_DATASETS else MolecularCFM
+    # NeuronCFM-only: toggle the generation-based structural validation metrics.
+    extra_cfm_kwargs = {}
+    if args.dataset in util.NEURON_DATASETS:
+        extra_cfm_kwargs["val_structural_metrics"] = args.val_structural_metrics
+        extra_cfm_kwargs["per_cell_class"] = args.per_cell_class
+        extra_cfm_kwargs["per_cell_class_min_count"] = args.per_cell_class_min_count
+        extra_cfm_kwargs["metric_report_level"] = args.metric_report_level
+        extra_cfm_kwargs["selection_health_max"] = selection_health_max(args)
+        extra_cfm_kwargs["tmd_cond_eval"] = args.tmd_cond_eval
+        extra_cfm_kwargs["tmd_cond_every"] = args.tmd_cond_every
+        extra_cfm_kwargs["tmd_cond_max_pairs"] = args.tmd_cond_max_pairs
+        extra_cfm_kwargs["val_plots"] = args.val_plots
+        extra_cfm_kwargs["val_plot_max_rows"] = args.val_plot_max_rows
     fm_model = cfm_cls(
         egnn_gen,
         vocab,
@@ -190,6 +321,7 @@ def build_model(args, dm, vocab):
         train_smiles=train_smiles,
         type_mask_index=type_mask_index,
         bond_mask_index=bond_mask_index,
+        **extra_cfm_kwargs,
         **hparams,
     )
     return fm_model
@@ -204,19 +336,22 @@ def build_dm(args, vocab):
         coord_std = util.GEOM_COORDS_STD_DEV
         padded_sizes = util.GEOM_DRUGS_BUCKET_LIMITS
 
-    elif args.dataset == "neurons":
-        coord_std = util.NEURON_COORDS_STD_DEV
-        padded_sizes = util.NEURON_BUCKET_LIMITS
+    elif args.dataset in util.DATASET_CONFIGS:
+        cfg = util.DATASET_CONFIGS[args.dataset]
+        coord_std = cfg.coord_std
+        padded_sizes = cfg.bucket_limits
 
     else:
         raise ValueError(
-            f"Unknown dataset {args.dataset}. Available: `qm9`, `geom-drugs`, `neurons`."
+            f"Unknown dataset {args.dataset}. Available: `qm9`, `geom-drugs`, "
+            + ", ".join(f"`{name}`" for name in util.NEURON_DATASETS)
+            + "."
         )
 
     data_path = Path(args.data_path)
 
     n_bond_types = util.get_n_bond_types(args.categorical_strategy)
-    if args.dataset == "neurons":
+    if args.dataset in util.NEURON_DATASETS:
         transform = partial(
             util.neuron_mol_transform, vocab=vocab, n_bonds=n_bond_types, coord_std=coord_std
         )
@@ -232,7 +367,13 @@ def build_dm(args, vocab):
 
     train_dataset = GeometricDataset.load(data_path / "train.smol", transform=transform)
     val_dataset = GeometricDataset.load(data_path / "val.smol", transform=transform)
-    val_dataset = val_dataset.sample(args.n_validation_mols)
+    # sample() draws without replacement, so asking for more than the split holds raises. Small
+    # corpora (the tree datasets have 337 val graphs vs the 1800 default) would die here.
+    n_val = min(args.n_validation_mols, len(val_dataset))
+    if n_val < args.n_validation_mols:
+        print(f"Val split has {n_val} graphs; using all of them "
+              f"(--n_validation_mols={args.n_validation_mols}).")
+    val_dataset = val_dataset.sample(n_val)
 
     type_mask_index = None
     bond_mask_index = None
@@ -332,22 +473,100 @@ def build_trainer(args):
     val_check_epochs = 1 if args.trial_run else args.val_check_epochs
 
     project_name = f"{util.PROJECT_PREFIX}-{args.dataset}"
-    print("Using precision '32'")
+    print(f"Using precision '{args.precision}'")
 
-    logger = WandbLogger(project=project_name, save_dir="wandb", log_model=True)
-    lr_monitor = LearningRateMonitor(logging_interval="step")
-    if args.dataset == "neurons":
-        # Neurons don't have RDKit validity; use the loss instead.
-        checkpointing = ModelCheckpoint(
-            every_n_epochs=val_check_epochs, monitor="val-loss", mode="min", save_last=True
+    # Construct the logger only when it will actually be used: a trial run discards it
+    # below, and building it eagerly makes `--trial_run` require wandb to be installed.
+    # log_model defaults to False: checkpoints are written to the local filesystem by the
+    # ModelCheckpoint callbacks below either way, and uploading them to W&B as artifacts is pure
+    # extra cost. It is not a small one -- the `snap-` callback runs with save_top_k=-1, and
+    # Lightning's WandbLogger.after_save_checkpoint uploads *every* save of a save_top_k=-1
+    # callback during training (loggers/wandb.py: `log_model == "all" or log_model is True and
+    # checkpoint_callback.save_top_k == -1`). At the defaults that is 30 weights-only snapshots
+    # of ~175 MB plus the two full end-of-run checkpoints, i.e. ~6 GB uploaded per run.
+    logger = None if args.trial_run else WandbLogger(
+        project=project_name, save_dir="wandb", log_model=args.wandb_log_model
+    )
+
+    # Make `epoch` the default x-axis for every panel.
+    #
+    # Without this, charts open on wandb's "Step", which is NOT the optimizer step: Lightning's
+    # WandbLogger never passes step= to wandb.log, so wandb's internal _step just counts log
+    # calls (~ global_step/log_every_n_steps, plus one per validation). Its scale is an
+    # artifact of the logging config, so two runs with different log_every_n_steps or
+    # val_check_epochs do not line up. The axis is also a per-project UI setting and
+    # `project_name` embeds the dataset, so every new --dataset starts a fresh project that
+    # would otherwise default back to "Step".
+    #
+    # Lightning's logger connector puts `epoch` in every payload it routes, so this works for
+    # all self.log() metrics. Guarded like neuron_cfm._log_run_constants: a logger without
+    # define_metric must not break the run.
+    if logger is not None:
+        try:
+            experiment = logger.experiment
+            experiment.define_metric("epoch")
+            experiment.define_metric("*", step_metric="epoch")
+        except Exception:
+            pass
+    if args.dataset in util.NEURON_DATASETS:
+        # Neurons don't have RDKit validity, so the best checkpoint is chosen either by
+        # loss (default) or by the gated morphometric MMD.
+        monitor = args.ckpt_monitor
+        if monitor == "val-morpho-selection" and not args.val_structural_metrics:
+            raise ValueError(
+                "--ckpt_monitor val-morpho-selection requires the structural metrics; "
+                "drop --no_val_structural_metrics."
+            )
+        n_devices = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if monitor == "val-morpho-selection" and n_devices > 1:
+            # sync_dist averages per-rank scalars, and the mean of per-rank MMDs is not
+            # the MMD of the union -- tolerable for monitoring, wrong for selection.
+            print(
+                "WARNING: --ckpt_monitor val-morpho-selection with "
+                f"{n_devices} visible GPUs. Under DDP each rank scores its own shard and "
+                "sync_dist averages the result; the mean of per-rank MMDs is NOT the "
+                "MMD of the union, so the selected checkpoint may not be the best one. "
+                "Restrict to one GPU (CUDA_VISIBLE_DEVICES) for morpho-based selection, "
+                "or monitor val-loss."
+            )
+        best_ckpt = ModelCheckpoint(
+            every_n_epochs=val_check_epochs,
+            monitor=monitor,
+            mode="min",
+            save_top_k=args.save_top_k,
+            save_last=True,
+            filename="best-{epoch:03d}",
         )
+        checkpointing = [best_ckpt]
+
+        # When selecting on loss, ALSO track the gated morphometric MMD under a separate
+        # prefix. The two disagree in general -- val-loss is a single-step denoising
+        # objective, mmd_morpho scores a full rollout -- and having both from one run is
+        # what lets you find out which one picks the better model on this data.
+        if args.val_structural_metrics and monitor != "val-morpho-selection":
+            checkpointing.append(ModelCheckpoint(
+                every_n_epochs=val_check_epochs,
+                monitor="val-morpho-selection",
+                mode="min",
+                save_top_k=args.save_top_k,
+                filename="morpho-{epoch:03d}",
+            ))
+        # Periodic weights-only trajectory snapshots: keep all, so a better checkpoint can
+        # be picked post-hoc by inspecting the logged structural-metric trajectories.
+        # Weights-only (no optimizer/scheduler state) since these are for eval/sampling,
+        # not training resumption; the EMA weights used for sampling live in the state_dict.
+        checkpointing.append(ModelCheckpoint(
+            every_n_epochs=val_check_epochs,
+            save_top_k=-1,
+            save_weights_only=True,
+            filename="snap-{epoch:03d}",
+        ))
     else:
-        checkpointing = ModelCheckpoint(
-            every_n_epochs=val_check_epochs, monitor="val-validity", mode="max", save_last=True
-        )
-
-    # No logger if doing a trial run
-    logger = None if args.trial_run else logger
+        checkpointing = [
+            ModelCheckpoint(
+                every_n_epochs=val_check_epochs, monitor="val-validity", mode="max", save_last=True
+            )
+        ]
 
     trainer = L.Trainer(
         min_epochs=epochs,
@@ -357,8 +576,8 @@ def build_trainer(args):
         accumulate_grad_batches=args.acc_batches,
         gradient_clip_val=args.gradient_clip_val,
         check_val_every_n_epoch=val_check_epochs,
-        callbacks=[lr_monitor, checkpointing],
-        precision="32",
+        callbacks=[*checkpointing],
+        precision=args.precision,
     )
     return trainer
 
@@ -376,7 +595,7 @@ def main(args):
     util.configure_fs()
 
     print("Building model vocab...")
-    vocab = util.build_neuron_vocab() if args.dataset == "neurons" else util.build_vocab()
+    vocab = util.build_neuron_vocab() if args.dataset in util.NEURON_DATASETS else util.build_vocab()
     print(f"Vocab complete. Size={vocab.size}")
 
     print("Loading datamodule...")
@@ -394,7 +613,7 @@ def main(args):
     print("Training complete.")
 
 
-if __name__ == "__main__":
+def get_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
     # Setup args
@@ -414,6 +633,35 @@ if __name__ == "__main__":
     parser.add_argument("--size_emb", type=int, default=DEFAULT_SIZE_EMB)
     parser.add_argument("--max_atoms", type=int, default=DEFAULT_MAX_ATOMS)
     parser.add_argument("--arch", type=str, default=DEFAULT_ARCH)
+    parser.add_argument("--tmd_conditioning", action="store_true",
+                        help="Condition generation on a per-graph TMD vector (requires data "
+                             "preprocessed with --compute_tmd). Off => unconditional, unchanged.")
+    parser.add_argument("--tmd_hidden", type=int, default=64,
+                        help="Hidden/projection dim for the TMD conditioning MLP (when enabled).")
+    parser.add_argument("--type_conditioning", action="store_true",
+                        help="Condition generation on a per-graph neuron cell-class label (requires a "
+                             "class-labelled corpus, e.g. neurons_conditional). Off => unconditional. "
+                             "Orthogonal to --tmd_conditioning.")
+    parser.add_argument("--class_hidden", type=int, default=16,
+                        help="Embedding dim for the cell-class conditioning (one_hot -> Linear).")
+    parser.add_argument("--tmd_cond_eval", action=argparse.BooleanOptionalAction, default=True,
+                        help="Log matched-pair TMD conditioning fidelity (val-tmd_cond-*). Ignored "
+                             "unless the model is TMD conditioned. These are the metrics that show "
+                             "the conditioning is being followed; mmd_tmd cannot, since the "
+                             "evaluation filtration is now also conditioned on.")
+    parser.add_argument("--tmd_cond_every", type=int, default=5,
+                        help="Run the matched-pair TMD evaluation every N validation epochs "
+                             "(a persim Wasserstein per pair per filtration is not cheap).")
+    parser.add_argument("--tmd_cond_max_pairs", type=int, default=64,
+                        help="Cap on the number of index-matched pairs scored per run of the "
+                             "matched-pair TMD evaluation.")
+    parser.add_argument("--val_plots", action=argparse.BooleanOptionalAction, default=True,
+                        help="Log sample-morphology grids to the logger each validation epoch "
+                             "(val-plot-*). Class-wise rows when class-conditioned, matched "
+                             "gen/GT pairs when TMD-conditioned, plain grids otherwise.")
+    parser.add_argument("--val_plot_max_rows", type=int, default=8,
+                        help="Row cap for the validation sample grids. 3D rendering costs one "
+                             "draw call per edge, so this bounds plotting time.")
 
     # Training args
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
@@ -430,6 +678,65 @@ if __name__ == "__main__":
     parser.add_argument("--bucket_cost_scale", type=str, default=DEFAULT_BUCKET_COST_SCALE)
     parser.add_argument("--no_ema", action="store_false", dest="use_ema")
     parser.add_argument("--self_condition", action="store_true")
+    parser.add_argument("--precision", type=str, default=DEFAULT_PRECISION,
+                        help="Lightning trainer precision. Default '32'. Use 'bf16-mixed' to "
+                             "roughly halve activation memory, which large graphs need.")
+    parser.add_argument("--grad_checkpointing", action="store_true",
+                        help="Recompute each message-passing layer during backward instead of "
+                             "storing its activations. Costs ~30%% compute for roughly an order "
+                             "of magnitude less memory; required for graphs beyond ~1000 nodes.")
+    # Neurons only: disable the generation-based structural validation metrics (skips a
+    # full ODE rollout over the val set each validation -- faster, but loses the trajectory).
+    parser.add_argument(
+        "--no_val_structural_metrics", action="store_false", dest="val_structural_metrics"
+    )
+    # Neurons only: per-cell-class stratified structural val metrics (only active for a
+    # class-conditioned run; harmless otherwise).
+    parser.add_argument(
+        "--no_per_cell_class", action="store_false", dest="per_cell_class",
+        help="Disable per-cell-class stratified structural validation metrics."
+    )
+    parser.add_argument(
+        "--per_cell_class_min_count", type=int, default=20,
+        help="Skip per-class metrics for classes with fewer than this many val graphs."
+    )
+    # Neurons only: which validation metrics reach the logger. Pure logging filter --
+    # every metric is computed regardless, so this cannot change a number.
+    parser.add_argument(
+        "--metric_report_level", type=str, default=DEFAULT_METRIC_REPORT_LEVEL,
+        choices=["headline", "standard", "full"],
+        help="Which structural metrics to log. 'standard' mirrors dendrite_gen's "
+             "dashboard; 'full' adds the redundant/low-power keys. Logging filter only."
+    )
+    # Neurons only: checkpoint selection.
+    parser.add_argument(
+        "--ckpt_monitor", type=str, default=DEFAULT_CKPT_MONITOR,
+        choices=["val-loss", "val-morpho-selection"],
+        help="Metric driving best-checkpoint selection. 'val-morpho-selection' is "
+             "mmd_morpho gated on the health fractions (see --selection_max_*). "
+             "Single-GPU only -- see the DDP warning. When this is 'val-loss' the "
+             "morpho-selected checkpoint is saved too, under a 'morpho-' prefix."
+    )
+    parser.add_argument(
+        "--save_top_k", type=int, default=1,
+        help="How many monitored checkpoints to keep (per monitor). The full-precision "
+             "checkpoints are ~437 MB each, so raising this costs real disk. Independent "
+             "of the weights-only 'snap-' snapshots, which always keep every validation."
+    )
+    parser.add_argument(
+        "--wandb_log_model", action="store_true",
+        help="Also upload checkpoints to W&B as artifacts. OFF by default: checkpoints are "
+             "always written locally under wandb/<project>/<run-id>/checkpoints/ regardless, "
+             "and the upload is ~6 GB per run at the defaults (every 'snap-' snapshot goes up "
+             "during training, because that callback uses save_top_k=-1). Turn it on only if "
+             "you need to pull checkpoints from the W&B UI rather than the training filesystem."
+    )
+    for _key, _flag in SELECTION_HEALTH_FLAGS.items():
+        parser.add_argument(
+            _flag, type=float, default=1.0,
+            help=f"Epochs with {_key} above this cannot be selected by "
+                 f"--ckpt_monitor val-morpho-selection. Default 1.0 (no gating)."
+        )
     # parser.add_argument("--mixed_precision", action="store_true")
     # parser.add_argument("--compile_model", action="store_true")
     # parser.add_argument("--distill", action="store_true")
@@ -449,10 +756,17 @@ if __name__ == "__main__":
         trial_run=False,
         use_ema=True,
         self_condition=True,
+        grad_checkpointing=False,
+        val_structural_metrics=True,
+        per_cell_class=True,
         # compile_model=False,
         # mixed_precision=False,
         # distill=False
     )
 
-    args = parser.parse_args()
+    return parser
+
+
+if __name__ == "__main__":
+    args = get_parser().parse_args()
     main(args)

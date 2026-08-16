@@ -230,6 +230,16 @@ class GeometricInterpolant(Interpolant):
 
         tuples = zip(from_mols, to_mols, times.tolist())
         interp_mols = [self._interpolate_mol(from_mol, to_mol, t) for from_mol, to_mol, t in tuples]
+
+        # Carry the target graph's conditioning vector (e.g. TMD) onto the noise/prior and
+        # interpolated mols so it reaches the model from whichever dict is used (interpolated
+        # at training, prior at sampling). No-op when to_mols carry no TMD.
+        for from_mol, interp_mol, to_mol in zip(from_mols, interp_mols, to_mols):
+            from_mol._tmd = to_mol._tmd
+            interp_mol._tmd = to_mol._tmd
+            from_mol._cell_class = to_mol._cell_class
+            interp_mol._cell_class = to_mol._cell_class
+
         return from_mols, to_mols, interp_mols, list(times)
 
     def _ot_map(self, from_mols: list[GeometricMol], to_mols: list[GeometricMol]) -> list[GeometricMol]:

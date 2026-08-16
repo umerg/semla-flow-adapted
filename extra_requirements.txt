@@ -3,3 +3,4 @@ networkx
 jupyter
 ipykernel
 py3Dmol
+persim==0.3.8

@@ -25,23 +25,36 @@ NEURON_NODE_TOKEN_INDEX = 2
 NEURON_EDGE_CLASS_INDEX = 1
 
 
-def parse_swc(path: Path) -> tuple[list[tuple[float, float, float]], list[tuple[int, int]], int]:
-    """Parse a cleaned SWC file. Returns (coords, edges, root_swc_id).
+def parse_swc(path: Path) -> tuple[list[tuple[float, float, float]], list[tuple[int, int]], int, Optional[int]]:
+    """Parse a cleaned SWC file. Returns (coords, edges, root_swc_id, cell_class).
 
     SWC columns (whitespace separated): id type x y z radius parent_id.
     Root nodes have parent_id <= 0. IDs are 1-indexed in the file; this
     function returns the original 1-indexed IDs and leaves remapping to the
     caller.
+
+    `cell_class` is the integer parsed from a `# cell_class N` header comment
+    (class-labelled corpora only); it is None when the header is absent (e.g. the
+    original unlabelled neuron corpus).
     """
     coords: list[tuple[float, float, float]] = []
     node_ids: list[int] = []
     edges: list[tuple[int, int]] = []
     root_id: Optional[int] = None
+    cell_class: Optional[int] = None
 
     with Path(path).open("r") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
+                # Capture the class label from a `# cell_class N` header if present.
+                if line.startswith("#"):
+                    tok = line.lstrip("#").split()
+                    if len(tok) == 2 and tok[0] == "cell_class":
+                        try:
+                            cell_class = int(tok[1])
+                        except ValueError:
+                            pass
                 continue
             parts = line.split()
             if len(parts) < 7:
@@ -71,7 +84,7 @@ def parse_swc(path: Path) -> tuple[list[tuple[float, float, float]], list[tuple[
         edges = [(id_remap[p], id_remap[c]) for (p, c) in edges]
         root_id = id_remap[root_id]
 
-    return coords, edges, root_id
+    return coords, edges, root_id, cell_class
 
 
 def swc_to_geometric_mol(path: Path, str_id: Optional[str] = None) -> GeometricMol:
@@ -81,7 +94,7 @@ def swc_to_geometric_mol(path: Path, str_id: Optional[str] = None) -> GeometricM
     the convention used by dendrite_gen's nx_graph_to_adj_pos.
     """
     path = Path(path)
-    coords, edges, root_id = parse_swc(path)
+    coords, edges, root_id, cell_class = parse_swc(path)
 
     n = len(coords)
     # Reorder so root is at index 0.
@@ -108,4 +121,5 @@ def swc_to_geometric_mol(path: Path, str_id: Optional[str] = None) -> GeometricM
         bond_types=bond_types,
         charges=charges,
         str_id=str_id or path.stem,
+        cell_class=cell_class,
     )

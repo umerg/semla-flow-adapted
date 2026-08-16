@@ -30,3 +30,5 @@ subslurm/
 slurm-*
 
 gmon.out
+# macOS
+.DS_Store

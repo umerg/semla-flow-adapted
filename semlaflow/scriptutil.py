@@ -2,6 +2,7 @@
 
 import math
 import resource
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -24,14 +25,207 @@ GEOM_COORDS_STD_DEV = 2.407038688659668
 QM9_BUCKET_LIMITS = [12, 16, 18, 20, 22, 24, 30]
 GEOM_DRUGS_BUCKET_LIMITS = [24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 72, 96, 192]
 
-# Neurons: measured over /Users/umer/Documents/neurons_final/train by
-# semlaflow.preprocess_neurons (post per-tree zero-CoM). Re-run that script to
-# refresh this value if the training corpus changes.
-# Bucket limits cover the observed size distribution (p5=18, median=46,
-# p95=108, max=258). Train max observed: 217.
-NEURON_COORDS_STD_DEV = 62.6894
-# NEURON_COORDS_STD_DEV = 0.0727
-NEURON_BUCKET_LIMITS = [24, 40, 56, 72, 96, 128, 160, 200, 220]
+# Cell-type (class) conditioning: single id<->name source of truth. Integer id == list index,
+# matching the `# cell_class N` SWC headers and dendrite_gen's utils.data_loading.CELL_CLASS_NAMES.
+NEURON_CELL_CLASS_NAMES = ["23P", "4P", "5P-IT", "5P-ET", "5P-NP", "6P-IT", "6P-CT"]
+
+# Botanical-tree genus labels, id == list index, matching the `# cell_class N` SWC headers and
+# dendrite_gen's utils.data_loading.TREE_GENUS_NAMES. Ordered by corpus frequency.
+TREE_GENUS_NAMES = ["Fagus", "Quercus", "Acer", "Carpinus", "Fraxinus", "Betula"]
+
+
+@dataclass(frozen=True)
+class DatasetConfig:
+    """Per-dataset constants for the neuron/tree (non-RDKit) pipeline.
+
+    coord_std     -- measured by preprocess_neurons.py over the train split, post per-tree
+                     zero-CoM. Re-run that script and refresh if the corpus changes.
+    bucket_limits -- BucketBatchSampler limits. Must cover the largest graph in *every* split,
+                     not just train (data/util.py raises otherwise, val loader included).
+    max_nodes     -- the `--max_atoms` cap the .smol files were built with. Note train.py's
+                     `--max_atoms` must be strictly greater than this, since SemlaGenerator
+                     indexes an Embedding(max_atoms) with the raw node count.
+    class_names   -- id -> name for cell-class conditioning. None => unconditional corpus,
+                     `--type_conditioning` is rejected for it.
+    units         -- physical unit of the raw SWC coordinates. Neurons are microns; the
+                     botanical-tree corpora are metres.
+    """
+
+    coord_std: float
+    bucket_limits: list[int]
+    max_nodes: int
+    class_names: list[str] | None = None
+    units: str = "um"
+    source: str = ""
+
+    @property
+    def n_classes(self) -> int:
+        return 0 if self.class_names is None else len(self.class_names)
+
+
+# Buckets below 200 are shared by every SWC corpus; only the tail differs. Empty buckets cost
+# nothing, so reusing the prefix keeps small graphs well-batched across all datasets.
+_SWC_BUCKET_PREFIX = [24, 40, 56, 72, 96, 128, 160, 200]
+
+# Every dataset that uses the neuron pipeline (neuron vocab/transform/NeuronCFM/loss-based
+# checkpointing). Adding an entry here is all that is needed to register a new SWC corpus.
+DATASET_CONFIGS: dict[str, DatasetConfig] = {
+    # Original unlabelled neuron corpus. Sizes: p5=18, median=46, p95=108, train max=217.
+    "neurons": DatasetConfig(
+        coord_std=62.6894,
+        bucket_limits=_SWC_BUCKET_PREFIX + [220],
+        max_nodes=256,
+        class_names=None,
+        source="/Users/umer/Documents/neurons_final",
+    ),
+    # Class-labelled neuron corpus: soma-rooted, binarized, `# cell_class N` headers. Measured
+    # over the full train split (22740 graphs); node counts min=8, max=242 (10 graphs > 256
+    # dropped) -> top bucket must cover 242.
+    "neurons_conditional": DatasetConfig(
+        coord_std=66.0298,
+        bucket_limits=_SWC_BUCKET_PREFIX + [224, 256],
+        max_nodes=256,
+        class_names=NEURON_CELL_CLASS_NAMES,
+        source="/Users/umer/Documents/neurons_conditional",
+    ),
+    # The neuron corpus of record. A strict superset of neurons_conditional: the same 26445 graphs
+    # with identical split assignment plus 24 more (23 train, 1 val), and no cap applied at build
+    # time -- max N is 537 against neurons_conditional's 242, so it also keeps the 33 train graphs
+    # a 256 cap discards. 22773/2529/1167 train/val/test. All 7 cell classes clear
+    # --per_cell_class_min_count 20 in val (866/642/336/65/28/353/239), unlike the tree corpora.
+    #
+    # The 24-node bucket of _SWC_BUCKET_PREFIX is folded into 40 here: only 444 of the 22773 train
+    # graphs land below 24 nodes, so the separate bucket bought little and starved at any
+    # --batch_cost above 1024. Peak is 18.2 GB fp32 at --batch_cost 1024 -- *lower* than
+    # neurons_conditional's 22.9 GB, because folding 224 into 256 removes the bucket that set it.
+    "neurons_conditional_full": DatasetConfig(
+        coord_std=66.1040,
+        bucket_limits=[40, 56, 72, 96, 128, 160, 200, 256, 537],
+        max_nodes=537,
+        class_names=NEURON_CELL_CLASS_NAMES,
+        source="/Users/umer/Documents/neurons_conditional_full",
+    ),
+    # Botanical-tree corpora: the same 3368 QSM reconstructions binarized to three depth caps.
+    # Base-rooted, binarized, `# cell_class N` genus headers, coords in METRES (not microns).
+    # All three keep 100% of their graphs at these caps -- nothing is dropped.
+    #
+    # These are far larger than any neuron (d20 median 338, max 3056 vs the neuron corpora's
+    # max 242), and SemlaFlow's activation memory is O(N^2) at ~57 KB per node-pair in fp32.
+    # Training d15/d20 therefore needs `--precision bf16-mixed --grad_checkpointing`; see the
+    # memory table in NEURONS.md section 6.
+    # NOTE d10's ladder does not use _SWC_BUCKET_PREFIX. The prefix's 24-node bucket holds 89 of
+    # its 2695 train graphs, far fewer than the batch size 312 the sampler gives that bucket at
+    # the default --batch_cost 1024, so it batches them poorly. It used to be worse than poor:
+    # under the old drop_last=True those 89 graphs were never sampled at all (RUN.md 3a). That
+    # is fixed in data/datamodules.py, so this ladder is now about batching quality, not
+    # correctness.
+    "trees_genus_d10": DatasetConfig(
+        coord_std=1.6417,
+        bucket_limits=[96, 128, 160, 200, 256, 320, 384],
+        max_nodes=384,
+        class_names=TREE_GENUS_NAMES,
+        units="m",
+        source="/Users/umer/Documents/trees_genus_d10",
+    ),
+    "trees_genus_d15": DatasetConfig(
+        coord_std=1.8062,
+        bucket_limits=_SWC_BUCKET_PREFIX + [264, 336, 416, 512, 640, 768, 1024, 1280, 1536],
+        max_nodes=1536,
+        class_names=TREE_GENUS_NAMES,
+        units="m",
+        source="/Users/umer/Documents/trees_genus_d15",
+    ),
+    "trees_genus_d20": DatasetConfig(
+        coord_std=1.9999,
+        bucket_limits=_SWC_BUCKET_PREFIX + [264, 336, 424, 528, 648, 784, 1024, 1408, 1792, 2304, 3072],
+        max_nodes=3072,
+        class_names=TREE_GENUS_NAMES,
+        units="m",
+        source="/Users/umer/Documents/trees_genus_d20",
+    ),
+    # Node-capped, sample-matched duplicates of the three tree corpora. The 199 trees whose *d20*
+    # node count exceeds 1110 are dropped from ALL THREE depths, so d10/d15/d20 hold the same 3169
+    # graphs (2538/316/315) and a cross-depth comparison stays a depth ablation rather than a
+    # depth-plus-composition one. That one shared rule bounds d15 at 666 and d10 at 268 because
+    # d15's own tail above 785 is a strict subset of d20's above 1110.
+    #
+    # The tail is 96% Fagus, so the cap *lowers* the class imbalance (88.18% -> 87.66%) and costs
+    # no rare-genus validation tree; it buys back 25/37/43% of the O(N^2) epoch cost and real 40 GB
+    # headroom at d20. Built by dendrite_gen/preprocessing/make_capped_tree_corpora.py from the
+    # uncapped corpora, which are left untouched; each corpus carries a BUILD_MANIFEST.json with
+    # the rule and these constants. Flags and caveats: RUN.md section 3a.
+    #
+    # These three deliberately do NOT use _SWC_BUCKET_PREFIX: its fine low end is right for the
+    # neuron corpora but starves the low buckets on a ~2.5k-graph corpus, leaving buckets holding
+    # fewer graphs than their own batch size. That is now only a batching-efficiency issue --
+    # train_dataloader passes drop_last=False, so an under-full bucket emits one short batch
+    # rather than being skipped entirely as it was before 2026-08-15 (RUN.md section 3a).
+    "trees_genus_d10_capped": DatasetConfig(
+        coord_std=1.6346,
+        bucket_limits=[96, 128, 160, 200, 240, 268],
+        max_nodes=268,
+        class_names=TREE_GENUS_NAMES,
+        units="m",
+        source="/Users/umer/Documents/trees_genus_d10_capped",
+    ),
+    "trees_genus_d15_capped": DatasetConfig(
+        coord_std=1.7935,
+        bucket_limits=[128, 200, 264, 336, 416, 512, 592, 666],
+        max_nodes=666,
+        class_names=TREE_GENUS_NAMES,
+        units="m",
+        source="/Users/umer/Documents/trees_genus_d15_capped",
+    ),
+    "trees_genus_d20_capped": DatasetConfig(
+        coord_std=1.9658,
+        bucket_limits=[160, 200, 264, 336, 424, 528, 648, 784, 928, 1110],
+        max_nodes=1110,
+        class_names=TREE_GENUS_NAMES,
+        units="m",
+        source="/Users/umer/Documents/trees_genus_d20_capped",
+    ),
+}
+
+
+def get_dataset_config(name: str) -> DatasetConfig:
+    """Strict lookup for build-time paths. Raises with the list of known names."""
+    try:
+        return DATASET_CONFIGS[name]
+    except KeyError:
+        raise ValueError(
+            f"Unknown neuron-pipeline dataset '{name}'. Known: {', '.join(DATASET_CONFIGS)}."
+        ) from None
+
+
+def class_names_for_dataset(name) -> list[str] | None:
+    """Tolerant lookup for checkpoint-driven paths; never raises.
+
+    Returns None for an unconditional corpus, a missing name, or a checkpoint that predates
+    the registry. Callers fall back to `id<N>` labels.
+    """
+    cfg = DATASET_CONFIGS.get(name) if isinstance(name, str) else None
+    return None if cfg is None else cfg.class_names
+
+
+def class_label(dataset, idx: int) -> str:
+    """Human-readable name for class id `idx`, falling back to `id<N>`."""
+    names = class_names_for_dataset(dataset)
+    return names[idx] if names is not None and 0 <= idx < len(names) else f"id{idx}"
+
+
+# Back-compat aliases. Derived from DATASET_CONFIGS -- edit the table above, not these.
+NEURON_COORDS_STD_DEV = DATASET_CONFIGS["neurons"].coord_std
+NEURON_BUCKET_LIMITS = DATASET_CONFIGS["neurons"].bucket_limits
+NEURON_CONDITIONAL_COORDS_STD_DEV = DATASET_CONFIGS["neurons_conditional"].coord_std
+NEURON_CONDITIONAL_BUCKET_LIMITS = DATASET_CONFIGS["neurons_conditional"].bucket_limits
+NEURON_NUM_CLASSES = len(NEURON_CELL_CLASS_NAMES)
+NEURON_DATASETS = tuple(DATASET_CONFIGS)
+
+# Catch table typos at import rather than 12 hours into a run.
+for _name, _cfg in DATASET_CONFIGS.items():
+    assert _cfg.coord_std > 0, f"{_name}: coord_std must be positive"
+    assert _cfg.bucket_limits == sorted(_cfg.bucket_limits), f"{_name}: bucket_limits not sorted"
+    assert max(_cfg.bucket_limits) <= _cfg.max_nodes, f"{_name}: top bucket exceeds max_nodes"
 
 PROJECT_PREFIX = "equinv"
 BOND_MASK_INDEX = 5

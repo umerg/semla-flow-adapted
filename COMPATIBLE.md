@@ -60,10 +60,11 @@ SemlaFlow-can't-do-X motivation for your K-Root-Children approach.
 | Formal charge               | (Nothing)                            | `charges[N]` filled with 0. The charge head exists but its loss weight is 0.                  |
 | Atomic-number → vocab map   | Vocab index already stored           | `neuron_mol_transform` skips the `PT.symbol_from_atomic(...)` step of `mol_transform`.        |
 | `CHARGE_IDX_MAP` remap      | (Not needed — all charges are 0)     | `neuron_mol_transform` skips the `CHARGE_IDX_MAP[charge]` lookup.                             |
-| QM9/GEOM coord std (1.72 / 2.41) | 62.6894 (measured on your train set) | Stored in `scriptutil.NEURON_COORDS_STD_DEV`. Re-run `preprocess_neurons.py` if data changes. |
-| QM9/GEOM bucket limits      | `[24, 40, 56, 72, 96, 128, 160, 200, 220]` | Chosen to cover your size distribution (p5=18, p95=108, observed train max=217).              |
-| Validity / novelty / energy metrics | (Not applicable)             | `NeuronCFM` empties `gen_metrics` and `stability_metrics`; overrides `validation_step`.       |
-| RDKit-based `predict.py`    | (Broken as-is; out of scope)         | Flagged in §9 as required future work for sampling.                                           |
+| QM9/GEOM coord std (1.72 / 2.41) | measured per dataset (62.6894 for `neurons`) | Stored in `scriptutil.DATASET_CONFIGS[…].coord_std`. Re-run `preprocess_neurons.py` if data changes. |
+| QM9/GEOM bucket limits      | per dataset (`[…, 200, 220]` for `neurons`) | `DATASET_CONFIGS[…].bucket_limits`, sized to that corpus (see §4.6).                    |
+| Validity / novelty / energy metrics | W1 over structural statistics | `NeuronCFM` empties `gen_metrics` and `stability_metrics`; `validation/dist_metrics.py` supplies the replacements. |
+| (No molecular analogue)     | Rooted-tree statistics               | Require a root; it is **estimated** for GT as well as generated graphs — see §4.11.           |
+| RDKit-based `predict.py`    | (Broken as-is; out of scope)         | `sample_neurons.py` is the neuron/tree equivalent. See §9.                                    |
 
 ---
 
@@ -119,33 +120,49 @@ root wherever the data says.
 (one-liner), but there's no reason to: zero-CoM is model-friendly and you're
 not conditioning on root position anyway.
 
-### 4.5 Coordinate scaling factor = 62.6894
-**Assumption:** `NEURON_COORDS_STD_DEV = 62.6894`, measured as
+> **Note (sections 4.5–4.7).** These three were originally written as global
+> assumptions for the single `neurons` corpus. They are now **per-dataset**, declared
+> in `scriptutil.DATASET_CONFIGS`; the values below are the `neurons` entry. See
+> `NEURONS.md` §6 for the botanical-tree corpora, whose coords are in metres and whose
+> graphs run to 3056 nodes.
+
+### 4.5 Coordinate scaling factor (per dataset; 62.6894 for `neurons`)
+**Assumption:** `DATASET_CONFIGS[<dataset>].coord_std`, measured as
 `np.concatenate([coords - coords.mean(0, keepdims=True) for coords in train]).std()`.
+Currently 62.6894 (`neurons`, µm), 66.0298 (`neurons_conditional`, µm),
+1.6417 / 1.8062 / 1.9999 (`trees_genus_d10/d15/d20`, **metres**).
 **Why:** matches what `mol_transform` does for molecules — scales coords so
 post-transform std is roughly 1. Prior sampler is standard-Gaussian, so we
 need data to be in the same scale.
-**Consequence:** generated samples must be multiplied by 62.6894 before
+**Consequence:** generated samples must be multiplied by that dataset's factor before
 saving/rendering, and compared against data at the same scale. The
 `coord_scale` attribute of `MolecularCFM` tracks this automatically.
 **Override path:** re-run `semlaflow/preprocess_neurons.py` whenever the
-training corpus changes and paste the new number into `scriptutil.py`.
+training corpus changes and paste the new number into that dataset's registry entry.
 
-### 4.6 Bucket limits `[24, 40, 56, 72, 96, 128, 160, 200, 220]`
-**Assumption:** this 9-bucket schedule covers the neuron size distribution.
-**Why:** p5=18, median=46, p75=65, p95=108, train-max=217. Drug buckets end
-at 192 and would silently drop your largest graphs. The chosen buckets put
-roughly balanced counts in each (1858/5054/4679/2338/1631/894/165/17/3
-observed during preprocess).
-**Override path:** edit `NEURON_BUCKET_LIMITS` in `scriptutil.py`. If you
+### 4.6 Bucket limits (per dataset)
+**Assumption:** each dataset's `bucket_limits` covers its size distribution. All SWC
+corpora share the prefix `[24, 40, 56, 72, 96, 128, 160, 200]` and extend it: `neurons`
+ends at 220, `neurons_conditional` at 256, and the tree corpora at 384 / 1536 / 3072.
+**Why:** for `neurons`, p5=18, median=46, p75=65, p95=108, train-max=217. Drug buckets
+end at 192 and would silently drop the largest graphs.
+**Constraint:** the top bucket must cover the largest graph in **every** split, not
+just train — `BucketBatchSampler` raises for the val loader too. Preprocessing prints
+the per-split maxima for exactly this reason.
+**Override path:** edit that dataset's `bucket_limits` in `scriptutil.py`. If you
 shard/downsample the dataset, re-check the distribution.
 
-### 4.7 Drop graphs with N > 256
-**Assumption:** the hard cap is 256 (SemlaFlow's `DEFAULT_MAX_ATOMS`).
-**Consequence:** 1 validation graph was silently dropped during preprocess
-(the one with N=258). 0 training graphs dropped (train max was 217).
-**Override path:** raise `--max_atoms` at training time if you also want those
-rare large val graphs scored. For generation-only you don't need this.
+### 4.7 Node cap (per dataset)
+**Assumption:** graphs above the dataset's `max_nodes` are dropped at preprocess time
+via `--max_atoms`. 256 for the neuron corpora (SemlaFlow's `DEFAULT_MAX_ATOMS`);
+384 / 1536 / 3072 for the tree corpora, which retain 100% of their graphs.
+**Consequence:** for `neurons`, 1 validation graph (N=258) was silently dropped.
+**Caution:** `train.py --max_atoms` is a *different* knob and must be strictly greater
+than the largest graph — `size_emb` is an `Embedding(max_atoms)` indexed by the raw
+node count. This is now checked with an explicit error.
+**Cost:** activation memory is O(N²) at ~57 KB per node-pair in fp32, so the cap is a
+memory decision as much as a data one. Beyond ~800 nodes on a 40 GB card you need
+`--precision bf16-mixed --grad_checkpointing`; see the table in `NEURONS.md` §6b.
 
 ### 4.8 Charges: keep the head, zero the loss
 **Assumption:** the charge classifier head (fixed at 7 classes) stays in the
@@ -189,6 +206,301 @@ fitting?" signal.
 usually the longest-trained EMA model. Fine for a baseline. If you want to
 select based on a more task-relevant metric, add one in
 `on_validation_epoch_end` and change the monitor.
+
+### 4.11 The root is *estimated* for ground-truth graphs too, never taken from the data
+
+This is the least obvious decision in the evaluation path, and the one most likely
+to look like a bug to a reviewer. It is deliberate.
+
+**Assumption:** both generated and ground-truth graphs get their root from the same
+estimator, `choose_root` (`validation/convert.py:152`), even though the ground-truth
+root is exactly known — `swc_to_geometric_mol` reorders the SWC root to index 0, so
+passing `root=0` for GT would be free and exact. We don't. Neither
+`neuron_cfm.py:134-135` nor `sample_neurons.py:286-287` passes `root=`.
+
+**Why:** it protects the **zero point of the metric**. Generated graphs carry no root
+marker — SemlaFlow emits an unordered point cloud plus an adjacency, so their root can
+only ever be estimated. If GT used the true root while generated graphs used an
+estimator, then `bifurcation_angle_w1` would measure *generation error + estimator
+bias*, with no way to separate the two, and **a perfect generator would still score a
+non-zero W1**. A metric whose floor is an unknown positive constant cannot be used to
+judge convergence or to compare checkpoints.
+
+Applying the same estimator to both sides keeps the floor at zero. The cost is
+attenuation: a symmetric error blurs both distributions and mildly *understates* real
+differences. That is the right direction to be wrong in — an under-sensitive metric
+with a trustworthy zero beats a sensitive one with a floating floor.
+
+**Where the estimator is weak, and what it costs.** `choose_root` first looks for a
+unique strict-maximum-degree node of degree ≥ 3 — the soma. That fires for 100% of
+neurons, so the neuron corpora are effectively using the true root anyway and none of
+this matters there. The botanical-tree corpora are the opposite case: `root_deg == 1`
+and no degree-2 nodes, so a binarized tree has hundreds of tied degree-3 nodes and the
+hub branch *never* fires. Every tree falls through to `pca_base_root`
+(`convert.py:143`), the extremal node along PC1.
+
+That decomposes into three questions, measured over 400–600 trees per corpus:
+
+1. Is PC1 the trunk axis? Yes — `|PC1 · trunk| ≈ 0.99` median.
+2. Is the true root one of PC1's *two* ends? Yes, 96–98% of the time. This is the
+   ceiling for any sign convention.
+3. Which of the two ends? `np.linalg.eigh` returns eigenvectors of arbitrary sign, so
+   originally this was a **coin flip** (46–52%). `_orient_axis` (`convert.py:90`) now
+   picks the end by node density — a crown is dense, a trunk base is sparse — with a
+   median-tail tie-break for tiny graphs.
+
+| corpus | exact root, raw `eigh` sign | with `_orient_axis` | ceiling | `bifurcation_angle` cost |
+|---|---:|---:|---:|---:|
+| `trees_genus_d10` | 50.7% | 86.5% | 96.2% | 0.54° on a 76.5° mean |
+| `trees_genus_d15` | 46.0% | 90.0% | 97.0% | 0.20° on a 75.8° mean |
+| `trees_genus_d20` | 51.5% | 93.8% | 98.0% | 0.05° on a 75.9° mean |
+
+The last column is the W1 between the bifurcation-angle distribution computed from the
+true root and from the estimated root — the actual metric-level error, ≤0.7%.
+
+**Consequence:** the residual error is smaller than the root-accuracy figure suggests,
+for a structural reason worth knowing: rooting at the wrong end of a tree only flips
+the parent pointer for nodes **on the path between the two candidate roots** (~`depth`
+nodes out of `N`), not for the whole tree. Every other node's parent is still "the
+neighbour towards the root" and is unchanged.
+
+**Only one metric is exposed at all.** Measured over 600 trees by recomputing every
+statistic from the true root and from the *opposite* end of PC1 — i.e. the worst case,
+not the average one:
+
+| metric | max change under a fully flipped root | why |
+|---|---|---|
+| `bifurcation_angle_w1` | **the affected metric** | the root picks which pair of a degree-3 node's three edges count as siblings |
+| `branch_length_w1` | exactly 0 | root-free — just per-edge Euclidean lengths |
+| `axial_extent_w1` | exactly 0 | calls `pca_axis` but consumes it **sign-invariantly** (`max - min`) |
+| `radial_span_w1` | exactly 0 | sign-invariant (`pdist` of the perpendicular components) |
+| `total_extent_w1` | exactly 0 | sign-invariant (`pdist`), rotation-invariant anyway |
+| `leaf_count_w1` | 1 | only whether the root itself counts as a leaf, against counts of 40–1500 |
+| `bifurcation_count_w1` | 0 | a degree-3 node has ≥2 children either way |
+| `node_count_w1` | exactly 0 | root-free. It used to also be ≈0 *by construction*, since N is fed in via the prior mask — see §4.12, that is no longer true once sanitisation lands |
+
+So the three extent metrics — the ones that actually move during training, per
+`NEURON_COORD_UNDERDISPERSION.md` — are provably untouched by the root question, and
+`_orient_axis` changed nothing for them.
+
+**Override path:** if you ever get a root oracle for *generated* graphs — e.g. a model
+that predicts the root, or the K-Root-Children approach where the root is explicit by
+construction — then pass `root=` on both sides and the attenuation disappears. Do not
+pass it on only one side. If you want to quantify the current attenuation for a paper,
+compute the metrics twice for GT (true root vs estimated) and report the difference;
+that is exactly the last column above.
+
+---
+
+### 4.12 Generated graphs are *sanitised* before any morphometric is computed
+
+The second least obvious decision, and the one with the most surface area.
+
+**Assumption:** `validation/sanitise.py:sanitise_graph` reduces every graph — generated
+*and* ground-truth — to `largest connected component → relabel → minimum spanning tree →
+contract non-root degree-2 nodes`, and the morphometrics score *that*. Structural health
+is measured on the **raw** graph first, and only then is the graph repaired.
+
+**Why it is necessary.** dendrite_gen's generator emits trees by construction. SemlaFlow's
+bond head emits N² independent edge logits, so it emits cycles, multifurcations, degree-2
+chain nodes and fragments. On such a graph the ported metrics are not merely noisy, they
+are undefined or wrong:
+
+- `branch_order_values` raises `KeyError` on any node unreachable from the root — 99/200
+  graphs at only 1% edge dropout.
+- `_root_tree` initialises `children` for *every* node but fills only the root's
+  component, so every node in another fragment counts as a **leaf**. Isolating 5 nodes of
+  a 130-node tree gave `leaf_count = 130`, `strahler = 1`, `partition_asymmetry = nan` —
+  while `radial_to_root` still returned 129 values. The topology and geometry halves of
+  the suite were scoring *different objects*.
+- `compute_tmd_barcode_diagram` hard-asserts `nx.is_tree`, and both call sites swallow the
+  exception, so `tmd_barlen_w1`/`mmd_tmd` would silently score only the graphs that came
+  out perfect — survivorship bias that *flatters* a worse model.
+
+**Why non-tree output is the normal case, not an edge case.** Keeping 95% of graphs
+cycle-free needs an edge false-positive rate below 2.1e-5 at N=70, 1.0e-6 at N=320 and
+1.1e-8 at N=3000. A 3-way softmax will not deliver 1e-8.
+
+**Why MST rather than a BFS spanning tree.** A spurious edge joins a random pair and is
+therefore long; a real branch segment is short. Measured over injected false positives the
+MST drops 85–94% of them at 99.5–100% true-edge recall, where BFS-from-root keeps ~78% and
+displaces real edges to do it.
+
+**The cost, stated plainly: sanitisation launders the defect.** `branch_length_w1` at
+fp 1e-3 falls from 0.1242 (raw) to 0.0026 (MST). This is a deliberate division of labour,
+not an oversight:
+
+> The morphometrics answer **"given a valid tree, is the morphology right?"**
+> The health block is the **only** answer to **"is it a valid tree?"**
+
+Measured on the shipped code, at low defect rates the morphometrics are *indistinguishable
+from clean* and only the health keys move:
+
+| defect | `disconnected` | `cycle` | `multifurcation` | `mmd_morpho` |
+|---|---:|---:|---:|---:|
+| clean | 0.000 | 0.000 | 0.000 | −0.0024 |
+| fp 1e-5 | 0.000 | **0.053** | **0.012** | −0.0024 |
+| fn 1% | **0.499** | 0.000 | 0.000 | −0.0019 |
+
+This is why `--ckpt_monitor val-morpho-selection` gates `mmd_morpho` on the health
+fractions. Selecting on `mmd_morpho` alone would let a model emitting garbage with a
+plausible spanning tree win.
+
+**Why applying it to GT too is safe, and required.** It is a verified no-op there —
+**0/2527** neuron and **0/337** tree val graphs are altered — so it costs nothing, and
+running both sides through the identical path makes a gen/GT asymmetry structurally
+impossible. The same argument as §4.11.
+
+**Three implementation traps, all of which bit during development:**
+
+1. `pca_base_root` returns a **positional index** into the coords array, and
+   `geometric_mol_to_nx` guarantees node id == coords row to make that valid. A plain
+   `G.subgraph(component)` keeps the original labels, so the returned "root" addresses a
+   different node or none at all. Every stage must relabel to contiguous `0..M-1`.
+2. `choose_root` must be called **exactly once, before contraction**, and carried through.
+   Calling it again afterwards runs it over a different node set, so the node protected
+   during contraction can fail to become the final root — leaving a non-root degree-2 node
+   alive and breaking the identity in §4.13. Choosing before is also the stable option:
+   contracting a degree-2 node joins its two neighbours, so every surviving node keeps its
+   degree and the hub rule cannot change its answer.
+3. The GT fit (`build_gt_cache`) must **not** be built during Lightning's sanity-check
+   loop, which runs 2 batches — the fit would come from ~16 graphs and poison every
+   subsequent epoch.
+
+**Why degree-2 contraction is in at all**, given it changes almost nothing (every metric
+shifts by ≤0.006 GT-sd at the observed 0.37% rate, and seven of them are *structurally*
+immune because they key on child counts or degree ≥ 3): it makes `node_count` exact
+(§4.13); it removes a real inconsistency, since `compute_tmd_barcode_diagram` already runs
+with `simplify_to_critical_tree=True` so the TMD keys were already seeing a contracted
+tree while `branch_length_w1` was not; and the distortion is linear in the rate
+(≈1.15 GT-sd of `branch_length` per unit rate), which matters for the far larger d15/d20
+graphs.
+
+### 4.13 `node_count` is a branch-point count, and `multifurcation` must exclude the root
+
+Two metric definitions that look like generic graph statistics but are corpus-specific.
+
+**`node_count` is topology, not size.** These are *critical trees*: every non-root node is
+a bifurcation or a terminal. Verified exactly — `1 + leaves + bifurcations + deg2 == N`
+holds for **100.00%** of graphs on all corpora, and GT `deg2` is **0.0000**, so on ground
+truth `N = 1 + leaves + bifurcations` and `corr(node_count, bifurcation_count) = 0.9970`.
+A node deficit *is* a branch-point deficit; there is no separate "size" reading to
+confound it.
+
+Consequently `node_count_w1` and `bifurcation_count_w1` both stay in the `standard` tier,
+where dendrite_gen demotes them. They are near-duplicates of *each other* (r = 0.997) and
+should be read as one signal, but they are redundant with nothing else.
+
+**It stops being trivially zero, and that is the point.** In-loop `val-node_count_w1` was
+0.0 at all 60 logged steps of the real run, because validation pairs the prior mask with
+the GT batch. After sanitisation it measures *how many of the fed-in nodes the model turned
+into real branch points*. Treat the change away from 0.0 as the metric starting to work,
+not as a regression.
+
+On the real run (`vivid-thunder-13` vs its paired GT) that measures **0.052 GT-sd**, i.e.
+node budget is being spent on branch points almost exactly as often as in real data:
+nodes 0.985× GT, leaves 1.002×, bifurcations 0.962×. It is currently one of the *weakest*
+signals in the suite, and that is the correct reading — this model's problem is geometry,
+not branching. It becomes informative precisely when a model starts wasting its node
+budget on fragments.
+
+> ⚠️ **Score against the *paired* GT split.** The prior draws its node counts from a
+> specific split, so comparing to a different corpus silently turns `node_count_w1` into a
+> corpus-mismatch measurement. `neuron_samples.smol` pairs with
+> `neurons_final_smol/val.smol` (1847 graphs, max N = 149), **not** with
+> `neurons_conditional` (2527 graphs, max N = 217) — against the wrong one the same run
+> reads 11.55 instead of 1.27, and the bifurcation ratio reads 0.778 instead of 0.962.
+
+(The key now means four different things across contexts: 0.0 in-loop pre-sanitisation,
+the prior's size draw offline in `sample_neurons.py`, fragmentation post-LCC, and learned
+stopping in dendrite_gen. `lcc_node_frac` is the unambiguous fragmentation reading.)
+
+**`multifurcation_frac` excludes the root.** Including it reads **99.6%** on real neuron
+ground truth, because the soma is a legitimate high-degree hub (per-graph max degree:
+median 8, max 16). Excluding the root it is a perfect discriminator — **0.0000** on GT for
+*both* corpora, **0.0623** on the real generations. The pooled non-root degree distribution
+on real neurons is exactly `{1: 0.5655, 3: 0.4345}`, with zero mass at degree 0, 2, 4, 5
+and 6.
+
+This is **not** circular even though `choose_root` prefers the unique maximum-degree node
+and so absorbs the offending hub 97.4% of the time: the *second-highest* node degree, which
+consults no root at all, flags the identical set of graphs. That equivalence is pinned by
+`tests/validation_metrics.py:test_multifurcation_matches_root_free_cross_check`. The
+root-excluding form is the one shipped because the second-highest form would miss a lone
+degree-4 node on the tree corpora, where the root has degree 1.
+
+### 4.14 `mmd_morpho` is not numerically comparable to dendrite_gen's
+
+Three independent reasons, any one of which is sufficient:
+
+1. **Different axial frame.** dendrite_gen decomposes extents along a fixed anatomical
+   `uhat`. SemlaFlow is fully E(3)-equivariant and the training transform applies a random
+   rotation, so no fixed axis exists; `axial_extent`/`radial_span` use a per-graph
+   root→centroid axis instead. Measured z under a perpendicular squash: fixed `uhat` 4.1,
+   root→centroid 3.3, per-graph PCA 2.6 — so the frame demonstrably changes sensitivity.
+2. **Different sanitisation** (§4.12).
+3. **`MORPHO_VERSION`** already forbids sharing an axis across a `MORPHO_KEYS` change; this
+   is the same class of break.
+
+Compare against the **real-vs-real floor** computed on this repo's own code instead, which
+is the only meaningful reference. The floor is per-corpus; measured over 6 disjoint splits:
+
+| corpus | `mmd_morpho` floor | n/side |
+| --- | ---: | ---: |
+| `neurons` (`neurons_final_smol/val`) | −0.00009 ± 0.00027 | 923 |
+| `neurons_conditional` | +0.00012 ± 0.00038 | 1263 |
+| `trees_genus_d10` | +0.00027 ± 0.00203 | 168 |
+
+Two related notes:
+
+- **`gen_degenerate_frac` and `morpho_nan_frac` will read ~0.0 here**, because sanitisation
+  removes their causes (0.0053/0.0271/0.1263 → 0.0000 at 1/5/20% edge dropout). They are
+  kept for field-for-field parity with dendrite_gen; the §4.12 health block is the live
+  disclosure for SemlaFlow's own failure modes.
+- **On a TMD-conditioned run, `mmd_tmd` and `tmd_barlen_w1` are NOT independent evidence.**
+  dendrite_gen's blind spot §8.3 — the evaluation filtration sitting inside the model's
+  conditioning set — now applies here too. It did not when SemlaFlow conditioned on `path`
+  alone, but the conditioning set is now `("path", "radial_root")` and evaluation still uses
+  `radial_root`, so both metrics partly score the model reproducing its own input. See §4.15
+  for why no fourth filtration is available to move evaluation onto.
+
+  This is disclosed rather than fixed, and it is a real limitation: on a conditioned run,
+  read those two as consistency checks, not as fidelity. The metrics that *are* independent
+  evidence of conditioning fidelity are the matched-pair ones in
+  `validation/tmd_conditional_eval.py`, logged as `val-tmd_cond-*` (in-loop) and written to
+  `metrics.json` under `"tmd_cond"` (offline). They pair each generated graph with the
+  specific GT graph whose descriptor produced it, so no amount of population-level mimicry
+  can flatter them. On an unconditional run nothing changes: `mmd_tmd` remains independent
+  and the `val-tmd_cond-*` block is not computed at all.
+
+### 4.15 Only rotation-invariant filtrations can be conditioned on
+
+`compute_tmd_mixed` implements four filtrations — `path`, `height`, `rho`, `radial_root` —
+but `NEURON_TMD_SUPPORTED_FILTRATIONS` admits only `path` and `radial_root`, and
+`preprocess_neurons.py --tmd_filtrations` will not accept the other two.
+
+`height` (projection onto an axis) and `rho` (distance from that axis) are defined relative
+to a fixed anatomical frame. dendrite_gen has one — it is SO(2)-equivariant about a
+configured `so2_axis` (`[0., 1., 0.]` for neurons), so the descriptor and the geometry share
+a frame and "reaches far along the apical axis" is a statement the model can act on.
+
+SemlaFlow has no such frame. `scriptutil.neuron_mol_transform` applies a uniformly random 3D
+rotation on every `__getitem__`, and `SemlaGenerator` is E(3)-equivariant. The TMD vector is
+computed once at preprocess time in the SWC's own frame and is *not* recomputed per epoch, so
+an axis-dependent channel would tell the model about an axis its input coordinates no longer
+agree with. The axis half of the signal is not merely noisy — it is unresolvable, and the
+model can only learn to ignore it. This is the same frame problem as §4.14's, applied to
+conditioning instead of metrics.
+
+`path` (geodesic distance from the soma) and `radial_root` (straight-line distance from the
+soma) are invariant under rotation about the root, so they survive the augmentation intact —
+verified to ~1e-7 in `tests/tmd_conditioning.py`. They are also complementary rather than
+redundant: their ratio is what contraction/tortuosity measures.
+
+Making `height`/`rho` usable would mean canonicalising the frame — replacing the random
+rotation with a deterministic alignment — which changes the symmetry the model is trained
+under and invalidates comparison with existing checkpoints. That is a separate decision, not
+a filtration-set change.
 
 ---
 
@@ -301,15 +613,20 @@ Gradients for dimensions 2/3/4 just push those logits downward uniformly
 ### Added
 | Path                                           | Role                                                         |
 |------------------------------------------------|--------------------------------------------------------------|
-| `semlaflow/data/swc.py`                        | Parse SWC → build `GeometricMol` directly (no RDKit).        |
-| `semlaflow/preprocess_neurons.py`              | Walk `neurons_final/{train, val_extended}`, emit `.smol`.    |
-| `semlaflow/models/neuron_cfm.py`               | `NeuronCFM(MolecularCFM)` — strips RDKit metrics.            |
-| `COMPATIBLE.md`                                | This file.                                                   |
+| `semlaflow/data/swc.py`                        | Parse SWC (incl. `# cell_class`) → build `GeometricMol` directly (no RDKit). |
+| `semlaflow/preprocess_neurons.py`              | Walk `<input_dir>/{train, val[_extended], test}`, emit `.smol`. |
+| `semlaflow/models/neuron_cfm.py`               | `NeuronCFM(MolecularCFM)` — strips RDKit metrics, adds structural validation. |
+| `semlaflow/sample_neurons.py`                  | Offline sampling + evaluation (the neuron/tree `predict.py`). |
+| `semlaflow/validation/`                        | W1 structural distribution metrics, `GeometricMol` ↔ networkx, root selection (§4.11), plots. |
+| `semlaflow/tmd/`                               | TMD persistence-image descriptor for optional conditioning.  |
+| `COMPATIBLE.md`                                | This file — design decisions, open to challenge.             |
+| `NEURONS.md`                                   | Conceptual guide + per-dataset details.                      |
+| `RUN.md`                                       | Runbook: exact commands and per-dataset flags.               |
 
 ### Modified
 | Path                                           | Change                                                                                    |
 |------------------------------------------------|-------------------------------------------------------------------------------------------|
-| `semlaflow/scriptutil.py`                      | Added `NEURON_COORDS_STD_DEV`, `NEURON_BUCKET_LIMITS`, `build_neuron_vocab`, `neuron_mol_transform`. |
+| `semlaflow/scriptutil.py`                      | Added `build_neuron_vocab`, `neuron_mol_transform`, and `DATASET_CONFIGS` — the per-dataset registry of coord scale / bucket limits / node cap / class names (the `NEURON_*` constants are now derived aliases). |
 | `semlaflow/train.py`                           | `--dataset neurons` branch in `build_dm`, `build_model`, `main`, `build_trainer`. Swap to `NeuronCFM`. Monitor `val-loss` for checkpointing. Skip `train_smiles` for neurons. |
 | `semlaflow/data/datamodules.py`                | macOS compat: fall back from `os.sched_getaffinity` to `os.cpu_count()`.                  |
 

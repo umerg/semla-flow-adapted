@@ -19,6 +19,7 @@ import argparse
 import json
 from functools import partial
 from pathlib import Path
+from time import perf_counter
 
 import lightning as L
 import torch
@@ -90,6 +91,10 @@ def load_model(args, vocab):
         self_cond=hparams["self_cond"],
         size_emb=hparams["size_emb"],
         max_atoms=hparams["max_atoms"],
+        tmd_dim=hparams.get("tmd_dim", 0),
+        tmd_hidden=hparams.get("tmd_hidden", 0),
+        n_classes=hparams.get("n_classes", 0),
+        class_hidden=hparams.get("class_hidden", 0),
     )
 
     type_mask_index = (
@@ -122,26 +127,36 @@ def load_model(args, vocab):
     return fm_model
 
 
+def _split_path(data_path: str, split: str) -> Path:
+    fname = {"train": "train.smol", "val": "val.smol", "test": "test.smol"}.get(split)
+    if fname is None:
+        raise ValueError(f"Unknown dataset_split '{split}'")
+    return Path(data_path) / fname
+
+
+def resolve_dataset(args, hparams) -> str:
+    """The corpus this checkpoint was trained on -- drives coord scale, buckets and class names."""
+    dataset = args.dataset or hparams.get("dataset")
+    if dataset is None:
+        raise SystemExit(
+            "This checkpoint records no 'dataset' hyperparameter. Pass --dataset explicitly so "
+            "the correct coord scale, bucket limits and class names are used."
+        )
+    return dataset
+
+
 def build_dm(args, hparams, vocab):
-    coord_std = util.NEURON_COORDS_STD_DEV
-    bucket_limits = util.NEURON_BUCKET_LIMITS
+    # Match the coord scale / buckets the checkpoint was trained with; each corpus has its own.
+    cfg = util.get_dataset_config(resolve_dataset(args, hparams))
+    coord_std = cfg.coord_std
+    bucket_limits = cfg.bucket_limits
 
     n_bond_types = util.get_n_bond_types(hparams["integration-type-strategy"])
     transform = partial(
         util.neuron_mol_transform, vocab=vocab, n_bonds=n_bond_types, coord_std=coord_std
     )
 
-    data_dir = Path(args.data_path)
-    if args.dataset_split == "train":
-        dataset_path = data_dir / "train.smol"
-    elif args.dataset_split == "val":
-        dataset_path = data_dir / "val.smol"
-    elif args.dataset_split == "test":
-        dataset_path = data_dir / "test.smol"
-    else:
-        raise ValueError(f"Unknown dataset_split '{args.dataset_split}'")
-
-    dataset = GeometricDataset.load(dataset_path, transform=transform)
+    dataset = GeometricDataset.load(_split_path(args.data_path, args.dataset_split), transform=transform)
     dataset = dataset.sample(args.n_molecules, replacement=True)
 
     type_mask_index = (
@@ -190,69 +205,65 @@ def build_dm(args, hparams, vocab):
 def dm_from_ckpt(args, vocab):
     checkpoint = torch.load(args.ckpt_path, map_location="cpu")
     hparams = checkpoint["hyper_parameters"]
-    return build_dm(args, hparams, vocab)
+    return build_dm(args, hparams, vocab), resolve_dataset(args, hparams)
 
 
-def samples_to_mols(output, edge_class_index: int) -> list[GeometricMol]:
-    """Extract a list of GeometricMol from a raw `_generate` output dict.
+def _add_per_class_metrics(metrics, gen_graphs, gen_classes, gt_graphs, gt_mols,
+                           compute_distribution_metrics, min_count,
+                           dataset=None, gt_cache=None, subset_fn=None) -> None:
+    """Populate metrics[f"class_<name>"] with per-class distribution metrics + print a table.
 
-    Skips the RDKit-based builder entirely. For each batch element:
-      * crop to real nodes via the mask,
-      * argmax over bond distributions,
-      * symmetrise (edge iff either direction's argmax equals edge_class),
-      * emit one GeometricMol with degenerate atomics and zero charges.
+    Generated graphs are grouped by their conditioning class (`gen_classes`), GT graphs by each
+    mol's own `_cell_class`. Classes with fewer than `min_count` graphs on either side are skipped.
+
+    `gt_cache` + `subset_fn` re-target the run-wide GT fit at each class's own GT graphs. The
+    reference set must be per-class, but the standardization, MMD bandwidths and TMD PCA must
+    stay run-wide or the classes are comparable neither to each other nor to the overall run.
     """
-    coords = output["coords"].detach().cpu()
-    atomics = output["atomics"].detach().cpu()
-    bond_dists = output["bonds"].detach().cpu()
-    masks = output["mask"].detach().cpu().bool()
+    if len(gen_classes) != len(gen_graphs):
+        print(f"[eval] warning: gen_classes ({len(gen_classes)}) != gen_graphs "
+              f"({len(gen_graphs)}); skipping per-class metrics.")
+        return
 
-    bond_argmax = bond_dists.argmax(dim=-1)
+    gt_classes = [
+        int(m._cell_class) if getattr(m, "_cell_class", None) is not None else None
+        for m in gt_mols
+    ]
+    classes = sorted({c for c in gen_classes if c is not None})
 
-    mols: list[GeometricMol] = []
-    for b in range(coords.size(0)):
-        n_real = int(masks[b].sum().item())
-        if n_real == 0:
+    print(f"\n[eval] per-cell-class metrics (min_count={min_count})")
+    print(f"{'Class':<10}{'n_gen':>7}{'n_gt':>7}{'mmd_morpho':>12}{'w1_pooled_n':>13}")
+    print("-" * 49)
+    for c in classes:
+        cname = util.class_label(dataset, c)
+        gen_c = [g for g, gc in zip(gen_graphs, gen_classes) if gc == c]
+        gt_c = [g for g, gc in zip(gt_graphs, gt_classes) if gc == c]
+        if len(gen_c) < min_count or len(gt_c) < min_count:
+            print(f"{cname:<10}{len(gen_c):>7}{len(gt_c):>7}{'(skip)':>12}{'':>13}")
             continue
-
-        coords_b = coords[b, :n_real].float()
-        atomics_b = atomics[b, :n_real].argmax(-1).long()
-        pair = bond_argmax[b, :n_real, :n_real]
-
-        edge = (pair == edge_class_index) | (pair.T == edge_class_index)
-        iu = torch.triu_indices(n_real, n_real, offset=1)
-        if iu.size(1) == 0:
-            bond_indices = torch.zeros((0, 2), dtype=torch.long)
-        else:
-            keep = edge[iu[0], iu[1]]
-            bond_indices = iu[:, keep].T.long()
-
-        bond_types = torch.full((bond_indices.size(0),), edge_class_index, dtype=torch.long)
-        charges = torch.zeros((n_real,), dtype=torch.long)
-
-        mols.append(
-            GeometricMol(
-                coords=coords_b,
-                atomics=atomics_b,
-                bond_indices=bond_indices,
-                bond_types=bond_types,
-                charges=charges,
-            )
-        )
-    return mols
+        cache_c = subset_fn(gt_cache, gt_c) if (gt_cache is not None and subset_fn) else None
+        m_c = compute_distribution_metrics(gen_c, gt_c, gt_cache=cache_c)
+        m_c["n_generated"] = float(len(gen_c))
+        m_c["n_ground_truth"] = float(len(gt_c))
+        metrics[f"class_{cname}"] = m_c
+        mmd = m_c.get("mmd_morpho", float("nan"))
+        pooled = m_c.get("w1_pooled_mean_normalized", float("nan"))
+        print(f"{cname:<10}{len(gen_c):>7}{len(gt_c):>7}{mmd:>12.5f}{pooled:>13.4f}")
+    print()
 
 
-def _split_path(data_path: str, split: str) -> Path:
-    fname = {"train": "train.smol", "val": "val.smol", "test": "test.smol"}.get(split)
-    if fname is None:
-        raise ValueError(f"Unknown dataset_split '{split}'")
-    return Path(data_path) / fname
-
-
-def evaluate_samples(args, gen_mols: list[GeometricMol], save_dir: Path) -> None:
+def evaluate_samples(args, gen_mols: list[GeometricMol], save_dir: Path,
+                     gen_classes: list[int] | None = None,
+                     timing: dict | None = None, dataset: str | None = None,
+                     paired_gt_mols: list[GeometricMol] | None = None) -> None:
     """Compare generated graphs against the ground-truth split: distribution metrics
     (Wasserstein-1 per structural stat) written to metrics.json + printed, and
     multi-azimuth plot grids of generated and GT samples saved as PNGs.
+
+    When `gen_classes` is given (type-conditioned runs), also computes per-neuron-type
+    stratified metrics: generated graphs are grouped by their conditioning class, GT graphs
+    by their own `_cell_class` label, and each class is scored distribution-vs-distribution
+    against that class's own GT, stored under `metrics["class_<name>"]`.
 
     Imports are local so the pure sampling path (and `--skip_eval`) pulls in no
     networkx/matplotlib.
@@ -260,7 +271,12 @@ def evaluate_samples(args, gen_mols: list[GeometricMol], save_dir: Path) -> None
     import matplotlib.pyplot as plt
 
     from semlaflow.validation.convert import geometric_mol_to_nx
-    from semlaflow.validation.dist_metrics import METRIC_KEYS, compute_distribution_metrics
+    from semlaflow.validation.dist_metrics import (
+        build_gt_cache,
+        compute_distribution_metrics,
+        keys_for_level,
+        subset_gt_cache,
+    )
     from semlaflow.validation.plot import plot_graph_grid_angles
 
     gt_path = _split_path(args.data_path, args.dataset_split)
@@ -274,45 +290,86 @@ def evaluate_samples(args, gen_mols: list[GeometricMol], save_dir: Path) -> None
     print(f"[eval] generated={len(gen_mols)} vs ground-truth({args.dataset_split})={len(gt_mols)}")
 
     # Both sets are already in physical units: the model rescales its output by
-    # coord_scale (= NEURON_COORDS_STD_DEV) inside _generate (see fm.py), and GT is
-    # loaded untransformed. So no extra scaling here -- coord_scale=1.0 for both.
+    # coord_scale (= the dataset's coord_std, see DATASET_CONFIGS) inside _generate (see fm.py),
+    # and GT is loaded untransformed. So no extra scaling here -- coord_scale=1.0 for both.
     gen_graphs = [geometric_mol_to_nx(m, coord_scale=1.0) for m in gen_mols]
     gt_graphs = [geometric_mol_to_nx(m, coord_scale=1.0) for m in gt_mols]
 
-    import networkx as nx
-
-    def _disconnected_frac(graphs):
-        if not graphs:
-            return 0.0
-        n_disc = sum(1 for g in graphs if g.number_of_nodes() > 0 and not nx.is_connected(g))
-        return n_disc / len(graphs)
-
-    gen_disc = _disconnected_frac(gen_graphs)
-    if gen_disc > 0:
-        print(f"[eval] note: {gen_disc:.1%} of generated graphs are disconnected "
-              "(root-based stats only cover the root's component).")
-
-    metrics = compute_distribution_metrics(gen_graphs, gt_graphs)
-    metrics["generated_disconnected_frac"] = gen_disc
+    # Same GT fit and same sanitisation as the in-loop path, so metrics.json lines up
+    # key-for-key with the `val-*` series.
+    gt_cache = build_gt_cache(gt_graphs)
+    metrics = compute_distribution_metrics(gen_graphs, gt_graphs, gt_cache=gt_cache)
     metrics["n_generated"] = float(len(gen_graphs))
     metrics["n_ground_truth"] = float(len(gt_graphs))
+
+    for key in ("disconnected_frac", "multifurcation_frac", "cycle_frac",
+                "isolated_node_frac", "non_critical_node_frac"):
+        val = metrics.get(key, 0.0)
+        if val and val > 0:
+            print(f"[eval] structural health: {key} = {val:.1%} "
+                  "(ground truth is exactly 0 for both corpora)")
+
+    # Per-neuron-type stratified metrics (type-conditioned runs only): group generated graphs by
+    # their conditioning class and GT graphs by their own label, then score each class separately.
+    if gen_classes is not None:
+        _add_per_class_metrics(
+            metrics, gen_graphs, gen_classes, gt_graphs, gt_mols,
+            compute_distribution_metrics, args.per_cell_class_min_count,
+            dataset=dataset, gt_cache=gt_cache, subset_fn=subset_gt_cache,
+        )
+
+    # Matched-pair TMD conditioning fidelity. The distribution metrics above cannot show
+    # the conditioning is followed -- their filtration is one the model trained on. These
+    # pair each sample with the specific GT graph whose descriptor produced it.
+    if paired_gt_mols:
+        from semlaflow.validation.tmd_conditional_eval import (
+            compute_conditional_pairwise_metrics,
+        )
+
+        n_pairs = min(len(gen_mols), len(paired_gt_mols))
+        if n_pairs < len(gen_mols):
+            print(f"[eval] TMD pairing covers {n_pairs}/{len(gen_mols)} samples")
+        # paired_gt_mols come off the dataloader in transformed units (the training
+        # transform divides by coord_std); scale them back to microns so both sides of
+        # every pair are in the same units as the generated graphs.
+        coord_std = util.get_dataset_config(dataset).coord_std if dataset else 1.0
+        paired_gt_graphs = [
+            geometric_mol_to_nx(m, coord_scale=coord_std) for m in paired_gt_mols[:n_pairs]
+        ]
+        metrics["tmd_cond"] = compute_conditional_pairwise_metrics(
+            gen_graphs[:n_pairs], paired_gt_graphs, max_pairs=args.tmd_cond_max_pairs,
+        )
+        print(f"\n[eval] matched-pair TMD conditioning fidelity "
+              f"(n={int(metrics['tmd_cond'].get('n_pairs', 0))})")
+        for key in sorted(metrics["tmd_cond"]):
+            print(f"{key:<40}{metrics['tmd_cond'][key]:.4f}")
+
+    if timing is not None:
+        metrics.update(timing)
 
     metrics_path = save_dir / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2))
     print(f"[eval] wrote metrics -> {metrics_path}")
 
-    print(f"\n[eval] distribution metrics (Wasserstein-1; lower is better)")
-    print(f"{'Metric':<26}Value")
-    print("-" * 38)
-    for key in METRIC_KEYS:
-        print(f"{key:<26}{metrics[key]:.4f}")
+    # `*_w1` and `mmd_*` are lower-is-better; `density_*`/`coverage_*` are higher-is-better;
+    # the health fractions are 0.0 on ground truth for both corpora.
+    print(f"\n[eval] distribution metrics (report level: {args.metric_report_level})")
+    print(f"{'Metric':<30}Value")
+    print("-" * 42)
+    for key in keys_for_level(args.metric_report_level):
+        if key in metrics:
+            print(f"{key:<30}{metrics[key]:.5f}")
     print()
 
-    # Multi-azimuth plot grids: generated and GT references at the same angles.
+    # Multi-azimuth plot grids: generated and GT references at the same angles. Graphs are
+    # raw, with the sanitisation overlay marking which parts the metrics above actually
+    # scored -- fragments grey, MST-cut edges orange, contracted degree-2 nodes shrunk. GT
+    # should come out entirely "kept" (sanitisation is a verified no-op there), so any
+    # colour on the reference grid points at something upstream.
     n = min(args.n_plot_examples, len(gen_graphs))
     gen_fig, gen_png = plot_graph_grid_angles(
         gen_graphs[:n], out_dir=save_dir, stem=Path(args.save_file).stem,
-        file_tag="gen3d", title_prefix="Gen", max_graphs=n,
+        file_tag="gen3d", title_prefix="Gen", max_graphs=n, sanitise_overlay=True,
     )
     plt.close(gen_fig)
     print(f"[eval] wrote generated plot grid -> {gen_png}")
@@ -321,6 +378,7 @@ def evaluate_samples(args, gen_mols: list[GeometricMol], save_dir: Path) -> None
     ref_fig, ref_png = plot_graph_grid_angles(
         gt_graphs[:n_gt], out_dir=save_dir, stem=Path(args.save_file).stem,
         file_tag="ref3d", title_prefix="GT", node_color="#1f77b4", max_graphs=n_gt,
+        sanitise_overlay=True,
     )
     plt.close(ref_fig)
     print(f"[eval] wrote ground-truth plot grid -> {ref_png}")
@@ -339,25 +397,145 @@ def main(args):
     print(f"Vocab size: {vocab.size}")
 
     print("Loading datamodule (size-prior source)...")
-    dm = dm_from_ckpt(args, vocab)
+    dm, dataset = dm_from_ckpt(args, vocab)
+    print(f"Dataset: {dataset}")
 
     print("Loading model...")
     model = load_model(args, vocab)
+
+    # TMD conditioning guards: keep ckpt and CLI flag consistent.
+    ckpt_conditional = getattr(model.gen, "tmd_dim", 0) > 0
+    if ckpt_conditional and not args.tmd_cond:
+        raise SystemExit(
+            "This checkpoint was trained with TMD conditioning (tmd_dim > 0). "
+            "Pass --tmd_cond to condition generation on the paired val graphs."
+        )
+    if args.tmd_cond and not ckpt_conditional:
+        raise SystemExit(
+            "--tmd_cond was set but this checkpoint has no TMD conditioning (tmd_dim = 0)."
+        )
+    if args.tmd_cond:
+        sample_mol = dm.test_dataset[0]
+        if getattr(sample_mol, "_tmd", None) is None:
+            raise SystemExit(
+                "--tmd_cond requires TMD vectors in the dataset, but none were found. "
+                "Re-run preprocess_neurons.py with --compute_tmd to regenerate the .smol."
+            )
+
+        # Width alone does not identify a descriptor: two different filtration sets of the
+        # same size load fine and produce a plausible-looking but meaningless run. Compare
+        # the names the checkpoint trained on against the ones this .smol was built with.
+        ckpt_filtrations = model.hparams.get("tmd_filtrations")
+        data_filtrations = getattr(sample_mol, "_tmd_filtrations", None)
+        if ckpt_filtrations is not None and data_filtrations is not None:
+            if tuple(ckpt_filtrations) != tuple(data_filtrations):
+                from semlaflow.tmd import neuron_tmd_dim
+
+                ckpt_dim = neuron_tmd_dim(ckpt_filtrations)
+                data_dim = int(sample_mol.tmd.shape[0])
+                # Only the equal-width case is the silent one worth calling out; a width
+                # mismatch would also surface as a shape error in tmd_proj.
+                detail = (
+                    f"Both are {data_dim}-dim, so nothing else would catch this."
+                    if ckpt_dim == data_dim
+                    else f"Widths differ ({ckpt_dim} vs {data_dim})."
+                )
+                raise SystemExit(
+                    "TMD filtration mismatch. This checkpoint was trained on "
+                    f"[{', '.join(ckpt_filtrations)}] but the dataset's vectors were built from "
+                    f"[{', '.join(data_filtrations)}]. {detail} Re-run preprocess_neurons.py "
+                    f"with --tmd_filtrations {' '.join(ckpt_filtrations)}."
+                )
+        else:
+            missing = "checkpoint" if ckpt_filtrations is None else "dataset"
+            print(
+                f"WARNING: the {missing} records no TMD filtration provenance, so the descriptor "
+                "cannot be verified. Re-run preprocess_neurons.py (and retrain) to enable the check."
+            )
+
+        names = ", ".join(data_filtrations) if data_filtrations else "unrecorded"
+        print(f"TMD conditioning ON ({names}): conditioning on paired val-graph TMD vectors.")
+
+    # Cell-class (neuron type) conditioning guards: keep ckpt and CLI flag consistent.
+    ckpt_class_conditional = getattr(model.gen, "class_hidden", 0) > 0
+    if ckpt_class_conditional and not args.type_cond:
+        raise SystemExit(
+            "This checkpoint was trained with cell-class conditioning (class_hidden > 0). "
+            "Pass --type_cond to condition generation on the paired val graphs' classes."
+        )
+    if args.type_cond and not ckpt_class_conditional:
+        raise SystemExit(
+            "--type_cond was set but this checkpoint has no cell-class conditioning (class_hidden = 0)."
+        )
+    if args.type_cond:
+        sample_mol = dm.test_dataset[0]
+        if getattr(sample_mol, "_cell_class", None) is None:
+            raise SystemExit(
+                "--type_cond requires cell_class labels in the dataset, but none were found. "
+                "Preprocess a class-labelled corpus (SWCs with a `# cell_class N` header)."
+            )
+        print("Cell-class conditioning ON: conditioning on paired val-graph classes.")
 
     device = _device()
     model.eval().to(device)
     print(f"Model on {device}. Running generation...")
 
+    # Local import keeps the pure-sampling module import free of networkx (convert.py).
+    from semlaflow.validation.convert import samples_to_mols
+
     test_dl = dm.test_dataloader()
     all_mols: list[GeometricMol] = []
+    gen_classes: list[int] = []  # conditioning class per emitted sample (type-conditioned runs)
+    # The specific GT graph each sample was conditioned on (TMD-conditioned runs). It cannot
+    # be recovered after the loop: `build_dm` resamples the split with replacement, so
+    # gt_mols[i] is NOT the pair of all_mols[i]. batch[1] is the `data` dict built from the
+    # same mols as the prior, so it is the only correct source for the pairing.
+    paired_gt_mols: list[GeometricMol] = []
     raw_batches: list[dict] = []
+    sampling_seconds_total = 0.0  # wall-clock spent inside _generate (the ODE rollout only)
+    n_sampled = 0                 # graphs the ODE integrated (rows fed to _generate)
     for batch in tqdm(test_dl):
         prior = {k: v.to(device) for k, v in batch[0].items()}
+        # Time only the _generate rollout. CUDA kernels are async, so synchronise on both
+        # sides or we'd measure kernel-launch overhead rather than the actual sampling work.
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        _t0 = perf_counter()
         with torch.no_grad():
             output = model._generate(prior, args.integration_steps, args.ode_sampling_strategy)
-        all_mols.extend(samples_to_mols(output, edge_class_index=NEURON_EDGE_CLASS_INDEX))
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        sampling_seconds_total += perf_counter() - _t0
+        n_sampled += prior["coords"].size(0)
+        batch_mols = samples_to_mols(output, edge_class_index=NEURON_EDGE_CLASS_INDEX)
+        all_mols.extend(batch_mols)
+        if args.tmd_cond and "tmd" in prior:
+            # Same mask, so samples_to_mols drops the same rows on both sides and the two
+            # lists stay 1:1. Still in transformed units -- rescaled at eval time.
+            paired_gt_mols.extend(
+                samples_to_mols(batch[1], edge_class_index=NEURON_EDGE_CLASS_INDEX)
+            )
+        if args.type_cond and "cell_class" in prior:
+            # samples_to_mols drops all-masked (empty) graphs; align the class labels the same way
+            # so gen_classes stays 1:1 with all_mols. Each sample's class == the paired prior's class.
+            masks = output["mask"].detach().cpu().bool()
+            cc = prior["cell_class"].detach().cpu().reshape(-1).tolist()
+            gen_classes.extend(int(cc[b]) for b in range(masks.size(0)) if int(masks[b].sum()) > 0)
         if args.save_raw:
             raw_batches.append({k: v.detach().cpu() for k, v in output.items()})
+
+    sampling_seconds_per_sample = sampling_seconds_total / max(n_sampled, 1)
+    sampling_samples_per_sec = n_sampled / sampling_seconds_total if sampling_seconds_total > 0 else 0.0
+    timing = {
+        "sampling_seconds_total": sampling_seconds_total,
+        "sampling_seconds_per_sample": sampling_seconds_per_sample,
+        "sampling_samples_per_sec": sampling_samples_per_sec,
+        "n_sampled": n_sampled,
+    }
+    print(
+        f"[timing] sampled {n_sampled} graphs in {sampling_seconds_total:.2f}s "
+        f"({sampling_seconds_per_sample * 1e3:.1f} ms/sample, {sampling_samples_per_sec:.1f} samples/s)"
+    )
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -377,7 +555,10 @@ def main(args):
 
     if not args.skip_eval:
         print("Evaluating samples (structural metrics + plots)...")
-        evaluate_samples(args, all_mols, save_dir)
+        evaluate_samples(args, all_mols, save_dir,
+                         gen_classes=gen_classes if args.type_cond else None, timing=timing,
+                         dataset=dataset,
+                         paired_gt_mols=paired_gt_mols if args.tmd_cond else None)
 
     print("Done.")
 
@@ -389,6 +570,10 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir", type=str, required=True)
     parser.add_argument("--save_file", type=str, default=DEFAULT_SAVE_FILE)
 
+    parser.add_argument("--dataset", type=str, default=None,
+                        help="Override the dataset name recorded in the checkpoint. Selects the "
+                             "coord scale, bucket limits and class names from "
+                             "scriptutil.DATASET_CONFIGS. Normally inferred from the checkpoint.")
     parser.add_argument("--dataset_split", type=str, default=DEFAULT_DATASET_SPLIT)
     parser.add_argument("--n_molecules", type=int, default=DEFAULT_N_MOLECULES)
     parser.add_argument("--batch_cost", type=int, default=DEFAULT_BATCH_COST)
@@ -400,10 +585,28 @@ if __name__ == "__main__":
     parser.add_argument("--save_raw", action="store_true",
                         help="Also dump raw per-batch model outputs (coords/atomics/bonds/mask) "
                              "as <save_file>.raw.pt for diagnostics.")
+    parser.add_argument("--tmd_cond", action="store_true",
+                        help="Paired conditional generation: condition each sample on the real "
+                             "val graph's TMD vector. Requires a TMD-trained checkpoint and a "
+                             ".smol built with --compute_tmd.")
+    parser.add_argument("--type_cond", action="store_true",
+                        help="Paired conditional generation: condition each sample on the real "
+                             "val graph's cell-class label. Requires a class-conditioned checkpoint "
+                             "and a class-labelled .smol. Enables per-class stratified metrics.")
     parser.add_argument("--skip_eval", action="store_true",
                         help="Skip post-sampling structural metrics + plots (pure sampling only).")
     parser.add_argument("--n_plot_examples", type=int, default=DEFAULT_N_PLOT_EXAMPLES,
                         help="Number of generated/GT samples per multi-azimuth plot grid.")
+    parser.add_argument("--tmd_cond_max_pairs", type=int, default=256,
+                        help="Cap on index-matched pairs scored by the matched-pair TMD evaluation "
+                             "(--tmd_cond runs only). A persim Wasserstein per pair per filtration.")
+    parser.add_argument("--per_cell_class_min_count", type=int, default=20,
+                        help="Per-class stratified metrics (with --type_cond): skip classes with "
+                             "fewer than this many generated or GT graphs.")
+    parser.add_argument("--metric_report_level", type=str, default="standard",
+                        choices=["headline", "standard", "full"],
+                        help="Which metrics to print. Every metric is computed and written to "
+                             "metrics.json regardless -- this only filters the printed table.")
 
     args = parser.parse_args()
     main(args)

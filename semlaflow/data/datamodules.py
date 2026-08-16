@@ -76,7 +76,18 @@ class SmolDM(L.LightningDataModule):
         return hparams
 
     def train_dataloader(self):
-        sampler = self._sampler(self.train_dataset, drop_last=True)
+        # drop_last=False (upstream SemlaFlow used True). With bucketing, drop_last=True has a
+        # failure mode that has nothing to do with the usual ragged-final-batch tradeoff: a bucket
+        # holding fewer graphs than its own batch size gets `len(bucket) // batch_size == 0`
+        # batches, and BucketBatchSampler.__iter__ picks buckets weighted by their batch count, so
+        # such a bucket is never drawn in ANY epoch and its graphs never enter training. On the
+        # ~2.7k-graph SWC corpora that reached 13.5% of the train split; on the ~300k-molecule sets
+        # this code came from, buckets are dense enough that it cannot happen.
+        # With drop_last=False the sampler emits one short batch instead (`n_batches += 1` in
+        # data/util.py, and __iter__ takes `remaining_items` for a bucket's final batch), so every
+        # graph is seen every epoch. Also removes the per-epoch remainder, which was benign --
+        # RandomSampler reshuffles each epoch -- but made an "epoch" 0.4-6.8% short of a full pass.
+        sampler = self._sampler(self.train_dataset, drop_last=False)
         batch_size = self.batch_cost if sampler is None else 1
         shuffle = sampler is None
 
@@ -207,6 +218,19 @@ class GeometricDM(SmolDM):
             charges = smolF.one_hot_encode_tensor(charges, n_charges)
 
         data = {"coords": coords, "atomics": atomics, "bonds": bonds, "charges": charges, "mask": mask}
+
+        # Surface the per-graph conditioning vector (e.g. TMD) if every real mol carries one.
+        # Stacked from the real mols (the prepended fake pad mol is not in smol_batch).
+        real_mols = smol_batch.to_list()
+        if real_mols and all(mol._tmd is not None for mol in real_mols):
+            data["tmd"] = torch.stack([torch.as_tensor(mol._tmd) for mol in real_mols]).float()
+
+        # Per-graph discrete class label (e.g. neuron cell class) -> (B,) long tensor.
+        if real_mols and all(mol._cell_class is not None for mol in real_mols):
+            data["cell_class"] = torch.stack(
+                [torch.as_tensor(mol._cell_class) for mol in real_mols]
+            ).long()
+
         return data
 
     def _get_padded_size(self, smol_batch):
