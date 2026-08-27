@@ -8,12 +8,14 @@ functions handle well (`branch_order_values` raises `KeyError` on an unreachable
 
 This module splits that problem in two:
 
-  * `graph_health` measures the structural violations on the **raw** graph. Every key it
-    returns is exactly 0.0 (or 1.0 for `lcc_node_frac`) on real ground truth for both the
-    neuron and the tree corpora, so any deviation is unambiguously a generator failure --
-    the same "sanity record" logic as dendrite_gen's `morpho_gt_nan_frac`.
+  * `graph_health` measures the structural violations. Every key it returns is exactly 0.0
+    (or 1.0 for `lcc_node_frac`) on real ground truth for both the neuron and the tree
+    corpora, so any deviation is unambiguously a generator failure -- the same "sanity
+    record" logic as dendrite_gen's `morpho_gt_nan_frac`. All but one key are measured on
+    the **raw** graph; `multifurcation_frac` is measured one stage in, immediately before
+    the repair it describes, for the reason given in `graph_health`'s docstring.
   * `sanitise_graph` reduces the graph to the well-defined critical tree that every
-    morphometric is written for.
+    morphometric is written for: largest component, spanning tree, binarised, contracted.
 
 **Order matters**: health must be measured before sanitisation, or sanitisation hides
 exactly the defects it is repairing. `dist_metrics.compute_distribution_metrics` does
@@ -30,6 +32,7 @@ import networkx as nx
 import numpy as np
 
 from .convert import choose_root
+from .structural_metrics import _root_tree
 
 __all__ = ["graph_health", "sanitise_graph", "axial_axis", "HEALTH_KEYS"]
 
@@ -60,7 +63,7 @@ def _degrees(G: nx.Graph) -> dict:
 
 
 def graph_health(graphs: list[nx.Graph]) -> dict[str, float]:
-    """Structural violation rates over a set of **raw** (unsanitised) graphs.
+    """Structural violation rates over a set of raw (unsanitised) graphs.
 
     On real ground truth every value here is 0.0 except `lcc_node_frac`, which is 1.0 --
     verified over 2527 `neurons_conditional` and 337 `trees_genus_d10` val graphs. So a
@@ -71,7 +74,8 @@ def graph_health(graphs: list[nx.Graph]) -> dict[str, float]:
     node but only 0.37% of nodes are degree-2, and the distortion tracks the latter.
 
       disconnected_frac      fraction of graphs that are not connected
-      multifurcation_frac    fraction with a **non-root** node of degree > 3
+      multifurcation_frac    fraction whose *spanning tree* has a non-root node of
+                             degree > 3 -- see the stage note below
       isolated_node_frac     fraction containing a degree-0 node
       cycle_frac             fraction with at least one independent cycle
       non_critical_node_frac fraction with a non-root node of degree exactly 2
@@ -79,21 +83,30 @@ def graph_health(graphs: list[nx.Graph]) -> dict[str, float]:
       degree2_node_frac      mean fraction of non-root nodes of degree exactly 2
       lcc_node_frac          mean |largest component| / N -- fragmentation magnitude
 
+    **`multifurcation_frac` is measured one stage in, not on the raw graph.** Every other
+    key here describes the graph as generated; this one describes what `_binarise` is
+    about to repair, so it is read off `_spanning_stage`'s output -- after the largest
+    component and the MST, immediately before binarisation. The two stages differ a lot:
+    over 400 graphs of `semla_tmd_samples` the raw rate is 0.0700 and the post-MST rate is
+    0.0225, because a cycle-closing edge inflates a node's degree and the MST then cuts
+    it. Reporting the raw number would credit binarisation with repairs the MST already
+    made, and would gate model selection on defects that never reach the scored object.
+    Both readings are still 0.0000 on all four GT corpora.
+
     There is deliberately no node-level magnitude for `multifurcation_frac`: the
     `degree_w1` marginal in `dist_metrics` already compares the full degree distribution,
     which subsumes it.
 
     Why `multifurcation_frac` excludes the root: including it reads **99.6%** on real
     neuron ground truth, because the soma is a legitimate high-degree hub (per-graph max
-    degree: median 8, max 16). Excluding the root it is 0.0000 on GT for both corpora and
-    0.0623 on real generations.
+    degree: median 8, max 16). Excluding the root it is 0.0000 on GT for every corpus.
 
     This is *not* circular even though `choose_root` prefers the unique maximum-degree
     node (and so absorbs an offending hub 97.4% of the time): the second-highest node
     degree, which involves no root selection at all, flags the identical set of graphs.
-    `tests/test_sanitise.py` pins that equivalence. The root-excluding form is the one
-    shipped because the second-highest form would miss a lone degree-4 node on the tree
-    corpora, where the root has degree 1.
+    `tests/validation_metrics.py` pins that equivalence. The root-excluding form is the
+    one shipped because the second-highest form would miss a lone degree-4 node on the
+    tree corpora, where the root has degree 1.
     """
     n = len(graphs)
     if n == 0:
@@ -136,14 +149,19 @@ def graph_health(graphs: list[nx.Graph]) -> dict[str, float]:
         root = G.graph.get("root")
         non_root = [d for k, d in degrees.items() if k != root]
         if non_root:
-            if max(non_root) > _MAX_NONROOT_DEGREE:
-                multifurcating += 1
             n_deg2 = sum(1 for d in non_root if d == 2)
             if n_deg2:
                 non_critical += 1
             deg2_fracs.append(n_deg2 / len(non_root))
         else:
             deg2_fracs.append(0.0)
+
+        # The one key read off the spanning tree rather than the raw graph. It uses that
+        # stage's own root, not `G.graph["root"]`, because that is the root binarisation
+        # will exempt.
+        T, mst_root, _keep = _spanning_stage(G)
+        if _has_multifurcation(T, mst_root):
+            multifurcating += 1
 
     def _mean(xs):
         return float(np.mean(xs)) if xs else float("nan")
@@ -164,8 +182,10 @@ def second_highest_degree_multifurcation_frac(graphs: list[nx.Graph]) -> float:
     """Root-free cross-check for `multifurcation_frac`; see `graph_health`.
 
     Uses the second-highest node degree, so it never consults `choose_root`. Exists to
-    prove the shipped root-excluding metric is not an artefact of root selection -- on
-    the real generations both give 0.0623 over the identical set of graphs.
+    prove the shipped root-excluding metric is not an artefact of root selection: it flags
+    the identical set of graphs. Measured at the same stage as the metric it checks --
+    `_spanning_stage`'s output -- or the two would disagree purely because one sees the
+    cycle-closing edges and the other does not.
     """
     if not graphs:
         return float("nan")
@@ -173,8 +193,9 @@ def second_highest_degree_multifurcation_frac(graphs: list[nx.Graph]) -> float:
     for G in graphs:
         if G.number_of_nodes() < 3:
             continue
-        ordered = sorted(_degrees(G).values(), reverse=True)
-        if ordered[1] > _MAX_NONROOT_DEGREE:
+        T, _root, _keep = _spanning_stage(G)
+        ordered = sorted(_degrees(T).values(), reverse=True)
+        if len(ordered) > 1 and ordered[1] > _MAX_NONROOT_DEGREE:
             hits += 1
     return hits / len(graphs)
 
@@ -226,6 +247,115 @@ def _min_spanning_tree(G: nx.Graph) -> nx.Graph:
     for _u, _v, data in T.edges(data=True):
         data.pop("_len", None)
     return T
+
+
+def _spanning_stage(G: nx.Graph) -> tuple[nx.Graph, int, list]:
+    """Everything before binarisation: LCC -> relabel -> MST -> root.
+
+    Returns ``(T, root, keep)``, where ``keep[i]`` is the raw id of relabelled id ``i``
+    (see `_largest_component_relabelled`).
+
+    Three callers need this prefix -- `sanitise_graph`, `sanitise_provenance`, and
+    `graph_health`, the last of them because `multifurcation_frac` is measured on ``T``.
+    Sharing one helper is what stops the three replays from drifting apart.
+
+    ``G`` must be non-empty; every caller already guards that.
+    """
+    H, keep = _largest_component_relabelled(G)
+    T = _min_spanning_tree(H)
+    pts = np.stack([T.nodes[k]["pos"] for k in sorted(T.nodes())])
+    return T, int(choose_root(T, pts)), keep
+
+
+def _has_multifurcation(T: nx.Graph, root: int) -> bool:
+    """Does any non-root node exceed the binary branching the corpora are cleaned to?"""
+    non_root = [d for k, d in T.degree() if k != root]
+    return bool(non_root) and max(non_root) > _MAX_NONROOT_DEGREE
+
+
+def _subtree_nodes(children: dict, u: int) -> list:
+    """Every node at or below `u`, given a rooted `children` map."""
+    out: list = []
+    stack = [u]
+    while stack:
+        v = stack.pop()
+        out.append(v)
+        stack.extend(children[v])
+    return out
+
+
+def _binarise(T: nx.Graph, root: int) -> tuple[nx.Graph, set]:
+    """Drop the smallest subtrees at every non-root node with more than two children.
+
+    Both GT corpora were binarised at preprocessing by dendrite_gen's
+    `clean_trees.normalize_high_degree`, so every GT critical tree is strictly binary away
+    from the root -- the pooled non-root degree distribution is exactly {1: 0.5655,
+    3: 0.4345}. The MST removes cycles, not degree, so without this a generated
+    trifurcation survives into the scored object and metrics like `partition_asymmetry`
+    (which averages over all child pairs) compare a strictly binary reference against a
+    multi-ary sample.
+
+    dendrite_gen ranked branches by radius, which we do not have on a generated graph.
+    Subtree node count is the stand-in: radius tracks the size of the arbour a branch
+    supports, and so does subtree size. Ties are the common case rather than the exception
+    -- 7 of the 9 offenders over 400 `semla_tmd_samples` graphs are ``[1, 1, 3]`` -- so
+    the tie-break is load-bearing: total branch cable length (stem included, so competing
+    leaves are separated by how far they reach) first, then node id for determinism. All
+    three keys are rotation invariant, which the rotation-invariance test in
+    `tests/validation_metrics.py` requires.
+
+    dendrite_gen splits a degree-4 node into two bifurcations instead of pruning it, and
+    only prunes at degree > 4. One uniform rule is used here instead: splitting would have
+    to invent a node position, and `sanitise_provenance` maps sanitised ids back to raw
+    ids positionally, so a node with no raw counterpart has nowhere to go. The cost is
+    small and measurable -- 9 nodes of 16724 (0.05%) over those 400 graphs, and only on
+    graphs that already violate the tree prior.
+
+    The root is exempt: a high-degree soma is legitimate, and counting it reads 99.6% on
+    real neuron GT (see `graph_health`).
+
+    Returns ``(H, dropped)``; ``H`` is ``T`` itself when nothing was dropped.
+    """
+    _parent, children = _root_tree(T, root)
+
+    # Reverse pre-order is a valid post-order, so subtree stats accumulate in one pass
+    # without recursing -- the same shape as `_postorder_subtree_stats`.
+    pre: list = []
+    stack = [root]
+    while stack:
+        u = stack.pop()
+        pre.append(u)
+        stack.extend(children[u])
+
+    # `cable[u]` includes the stem edge from u's parent, so it measures the whole branch
+    # a parent would be dropping -- for a leaf that is the stem alone, not zero.
+    size: dict = {}
+    cable: dict = {}
+    for u in reversed(pre):
+        size[u] = 1 + sum(size[c] for c in children[u])
+        p = _parent.get(u)
+        stem = 0.0 if p is None else float(
+            np.linalg.norm(T.nodes[u]["pos"] - T.nodes[p]["pos"])
+        )
+        cable[u] = stem + sum(cable[c] for c in children[u])
+
+    # Pre-order, so a node inside an already-dropped subtree is skipped when reached.
+    dropped: set = set()
+    for u in pre:
+        if u == root or u in dropped:
+            continue
+        kids = children[u]
+        if len(kids) <= 2:
+            continue
+        ranked = sorted(kids, key=lambda c: (-size[c], -cable[c], c))
+        for c in ranked[2:]:
+            dropped.update(_subtree_nodes(children, c))
+
+    if not dropped:
+        return T, dropped
+    H = T.copy()
+    H.remove_nodes_from(dropped)
+    return H, dropped
 
 
 def _contract_degree_two(T: nx.Graph, root: int) -> nx.Graph:
@@ -309,15 +439,17 @@ def sanitise_graph(G: nx.Graph) -> nx.Graph:
       1. largest connected component
       2. relabel to contiguous ids 0..M-1        (see `_largest_component_relabelled`)
       3. minimum spanning tree by edge length    (see `_min_spanning_tree`)
-      4. `choose_root` -- ONCE, here (see below)
-      5. contract non-root degree-2 nodes        (see `_contract_degree_two`)
-      6. relabel again, carrying the root, and stash the root->centroid axis
+      4. `choose_root` -- ONCE, here (see below)     (steps 1-4: `_spanning_stage`)
+      5. binarise: drop the smallest subtrees    (see `_binarise`)
+      6. contract non-root degree-2 nodes        (see `_contract_degree_two`)
+      7. relabel again, carrying the root, and stash the root->centroid axis
 
     **The root is chosen exactly once, before contraction, and carried through.** Calling
     `choose_root` again afterwards would run it over a different node set, so the node
     protected during contraction could fail to be the final root -- leaving a non-root
     degree-2 node alive and breaking the ``1 + leaves + bifurcations == N`` identity that
-    makes `node_count` a branch-point count.
+    makes `node_count` a branch-point count. Binarisation never touches the root, so it
+    cannot invalidate that choice either.
 
     Choosing before contraction is also the stable option: contracting a degree-2 node
     joins its two neighbours, so every surviving node keeps its degree. The degree
@@ -328,8 +460,21 @@ def sanitise_graph(G: nx.Graph) -> nx.Graph:
     A degree-2 *root* is fine and is preserved: it has two children, so it is neither a
     leaf nor a violation of the identity above (which excludes the root).
 
-    Ground-truth graphs must be passed through this too. It is a verified no-op there
-    (0/2527 neuron and 0/337 tree val graphs altered), so it costs nothing and makes a
+    **Binarisation runs before contraction, not after.** dendrite_gen's own pipeline
+    normalises degree on an already-collapsed tree, but placing it here buys two things:
+    the dropped set comes out in spanning-tree ids, which is what `sanitise_provenance`
+    needs to map it back onto raw nodes, and contraction stays the last structural step so
+    the "no non-root degree-2 survives" invariant needs no fresh argument. The set of
+    offending nodes is identical either way -- a degree-2 chain node has one child and can
+    never be a multifurcation -- so all that moves is the subtree-size ranking basis, by
+    the 0.37% of nodes that are degree-2 on real generations.
+
+    Binarisation cannot itself create a non-root degree-2 node: a node with more than two
+    children keeps exactly two, so it lands at degree 3. Contraction is not run twice.
+
+    Ground-truth graphs must be passed through this too. Every step is a verified no-op
+    there -- 0/2527 neuron and 0/337 tree val graphs altered, and `multifurcation_frac` is
+    0.0000 on all four corpora both raw and post-MST -- so it costs nothing and makes a
     gen/GT asymmetry structurally impossible.
 
     Returns an empty graph unchanged.
@@ -340,16 +485,13 @@ def sanitise_graph(G: nx.Graph) -> nx.Graph:
         H.graph["axis"] = np.array([0.0, 0.0, 1.0])
         return H
 
-    H, _keep = _largest_component_relabelled(G)
-    H = _min_spanning_tree(H)
-
-    pts = np.stack([H.nodes[k]["pos"] for k in sorted(H.nodes())])
-    root = choose_root(H, pts)
+    T, root, _keep = _spanning_stage(G)
+    H, _dropped = _binarise(T, root)
     H = _contract_degree_two(H, root)
 
-    # Contraction leaves gaps in the id sequence, and `pca_base_root`'s positional-index
-    # contract requires node id == coords row. Carry the root through the remap rather
-    # than re-deriving it.
+    # Binarisation and contraction both leave gaps in the id sequence, and
+    # `pca_base_root`'s positional-index contract requires node id == coords row. Carry
+    # the root through the remap rather than re-deriving it.
     order = sorted(H.nodes())
     if order != list(range(len(order))):
         remap = {old: i for i, old in enumerate(order)}
@@ -367,8 +509,8 @@ def sanitise_graph(G: nx.Graph) -> nx.Graph:
 
 
 # Node and edge states reported by `sanitise_provenance`.
-PROVENANCE_NODE_STATES = ("kept", "contracted", "fragment")
-PROVENANCE_EDGE_STATES = ("kept", "excess", "fragment")
+PROVENANCE_NODE_STATES = ("kept", "contracted", "pruned", "fragment")
+PROVENANCE_EDGE_STATES = ("kept", "excess", "pruned", "fragment")
 
 
 def sanitise_provenance(G: nx.Graph) -> dict:
@@ -381,12 +523,18 @@ def sanitise_provenance(G: nx.Graph) -> dict:
 
         nodes   kept       survives into the critical tree
                 contracted in the spanning tree, collapsed by `_contract_degree_two`
+                pruned     in the spanning tree, dropped by `_binarise`
                 fragment   outside the largest connected component
-        edges   kept       in the spanning tree
+        edges   kept       in the spanning tree, and not inside a pruned subtree
                 excess     inside the LCC, cut by the MST -- the cycle-closing edges
+                pruned     in the spanning tree, incident to a pruned node
                 fragment   outside the LCC
 
-    Each triple partitions the raw graph exactly.
+    Each quadruple partitions the raw graph exactly.
+
+    ``pruned`` wins over ``contracted`` where they overlap: a degree-2 chain node inside a
+    dropped branch is gone because the branch was dropped, which is the more informative
+    thing to show.
 
     Edges follow the MST, not the contraction: a raw edge inside a contracted chain counts
     as *kept*, because its geometry is represented in the critical tree by the single
@@ -406,33 +554,38 @@ def sanitise_provenance(G: nx.Graph) -> dict:
     all_nodes = set(G.nodes())
     all_edges = {_key(u, v) for u, v in G.edges()}
     empty = {
-        "kept_nodes": set(), "contracted_nodes": set(), "fragment_nodes": all_nodes,
-        "kept_edges": set(), "excess_edges": set(), "fragment_edges": all_edges,
+        "kept_nodes": set(), "contracted_nodes": set(), "pruned_nodes": set(),
+        "fragment_nodes": all_nodes,
+        "kept_edges": set(), "excess_edges": set(), "pruned_edges": set(),
+        "fragment_edges": all_edges,
     }
     if G.number_of_nodes() == 0:
         return empty
 
-    # Step 1: largest connected component. `keep[i]` is the raw id of relabelled id `i`.
-    H, keep = _largest_component_relabelled(G)
+    # Steps 1-4: largest connected component, MST, root. `keep[i]` is the raw id of
+    # relabelled id `i`, so every result below maps straight back onto the raw graph.
+    T, root, keep = _spanning_stage(G)
     lcc_nodes = set(keep)
-    lcc_edges = {_key(keep[u], keep[v]) for u, v in H.edges()}
+    lcc_edges = {_key(u, v) for u, v in G.subgraph(keep).edges()}
+    mst_edges = {_key(keep[u], keep[v]) for u, v in T.edges()}
 
-    # Step 2: minimum spanning tree. Everything it drops is an edge inside the LCC.
-    T = _min_spanning_tree(H)
-    kept_edges = {_key(keep[u], keep[v]) for u, v in T.edges()}
+    # Step 5: binarisation drops whole subtrees, so an edge goes with either endpoint.
+    _B, dropped = _binarise(T, root)
+    pruned_nodes = {keep[i] for i in dropped}
+    pruned_edges = {e for e in mst_edges if e & pruned_nodes}
 
-    # Steps 3-4: root selection, then degree-2 contraction. `_contract_degree_two` only
-    # ever removes nodes, so the difference is exactly the collapsed set.
-    pts = np.stack([T.nodes[k]["pos"] for k in sorted(T.nodes())])
-    root = choose_root(T, pts)
-    C = _contract_degree_two(T, root)
+    # Step 6: degree-2 contraction. `_contract_degree_two` only ever removes nodes, so
+    # whatever is left in the LCC and not pruned is the collapsed set.
+    C = _contract_degree_two(_B, root)
     kept_nodes = {keep[i] for i in C.nodes()}
 
     return {
         "kept_nodes": kept_nodes,
-        "contracted_nodes": lcc_nodes - kept_nodes,
+        "contracted_nodes": lcc_nodes - kept_nodes - pruned_nodes,
+        "pruned_nodes": pruned_nodes,
         "fragment_nodes": all_nodes - lcc_nodes,
-        "kept_edges": kept_edges,
-        "excess_edges": lcc_edges - kept_edges,
+        "kept_edges": mst_edges - pruned_edges,
+        "excess_edges": lcc_edges - mst_edges,
+        "pruned_edges": pruned_edges,
         "fragment_edges": all_edges - lcc_edges,
     }

@@ -179,6 +179,169 @@ class SanitiseTests(unittest.TestCase):
         self.assertEqual(once.number_of_edges(), twice.number_of_edges())
 
 
+def _extra_child(G, node, offset):
+    """Attach a new leaf to `node`, `offset` away. Returns its id."""
+    nid = max(G.nodes()) + 1
+    G.add_node(nid, pos=np.asarray(G.nodes[node]["pos"], dtype=float)
+               + np.asarray(offset, dtype=float))
+    G.add_edge(node, nid)
+    return nid
+
+
+def _hub_multifurcation(offsets, hub_children=5):
+    """Hub root -> node `u` -> one leaf per offset. Returns ``(G, u, leaves)``.
+
+    The hub is load-bearing. `choose_root` takes the *unique* strict degree maximum, so
+    the root must out-rank `u` by more than one: give `u` an extra child in a fixture
+    built on `_binary_tree(root_children=4)` and `u` ties the root at degree 4, root
+    selection falls back to `pca_base_root`, the tree is re-rooted at some leaf, and the
+    old root becomes a non-root multifurcation of its own. Every offset here hangs off a
+    node the hub out-ranks by a clear margin, so only `u` is ever the offender.
+    """
+    G = nx.Graph()
+    G.add_node(0, pos=np.zeros(3))
+    nid = 1
+    for i in range(hub_children):
+        G.add_node(nid, pos=np.array([float(i + 1), -5.0, 0.0]))
+        G.add_edge(0, nid)
+        nid += 1
+
+    u = nid
+    G.add_node(u, pos=np.array([0.0, 0.0, 1.0]))
+    G.add_edge(0, u)
+    nid += 1
+
+    leaves = []
+    for off in offsets:
+        G.add_node(nid, pos=G.nodes[u]["pos"] + np.asarray(off, dtype=float))
+        G.add_edge(u, nid)
+        leaves.append(nid)
+        nid += 1
+
+    G.graph["root"] = 0
+    assert G.degree(0) > G.degree(u), "hub must stay the unique degree maximum"
+    return G, u, leaves
+
+
+class BinariseTests(unittest.TestCase):
+    """The corpora are binarised away from the root; generations must be scored the same.
+
+    dendrite_gen's `clean_trees.normalize_high_degree` did this to the ground truth at
+    preprocessing, so a generated trifurcation reaching the morphometrics would be
+    compared against a reference that structurally cannot contain one.
+    """
+
+    @staticmethod
+    def _positions(G):
+        return {tuple(np.round(G.nodes[k]["pos"], 9)) for k in G.nodes()}
+
+    def test_trifurcation_loses_only_its_smallest_subtree(self):
+        """Subtree size decides: the two-node branch outranks both single leaves."""
+        G, u, leaves = _hub_multifurcation(
+            [[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.5]]
+        )
+        # Two children, not one: a single child would leave leaves[0] at degree 2 and
+        # contraction would remove it as well, confusing what binarisation did.
+        big = _extra_child(G, leaves[0], [1.0, 0.0, 0.0])
+        _extra_child(G, leaves[0], [1.0, 1.0, 0.0])
+        self.assertEqual(G.degree(u), 4)
+
+        S = sanitise_graph(G)
+        kept = self._positions(S)
+        self.assertEqual(S.number_of_nodes(), G.number_of_nodes() - 1)
+        self.assertTrue(nx.is_tree(S))
+        for survivor in (leaves[0], big, leaves[1]):
+            self.assertIn(tuple(np.round(G.nodes[survivor]["pos"], 9)), kept)
+        self.assertNotIn(
+            tuple(np.round(G.nodes[leaves[2]]["pos"], 9)), kept,
+            "the smallest branch is the one that goes",
+        )
+
+    def test_four_children_land_at_exactly_two(self):
+        G, u, _leaves = _hub_multifurcation(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]],
+            hub_children=6,
+        )
+        self.assertEqual(G.degree(u), 5)
+
+        S = sanitise_graph(G)
+        non_root = [d for k, d in S.degree() if k != S.graph["root"]]
+        self.assertLessEqual(max(non_root), 3)
+        self.assertEqual(S.number_of_nodes(), G.number_of_nodes() - 2)
+
+    def test_a_high_degree_root_is_exempt(self):
+        """The soma is a legitimate hub: a degree-6 root must survive untouched."""
+        G = _binary_tree(depth=2, root_children=6)
+        S = sanitise_graph(G)
+        self.assertEqual(S.number_of_nodes(), G.number_of_nodes())
+        self.assertEqual(S.degree(S.graph["root"]), 6)
+
+    def test_cable_length_breaks_a_subtree_size_tie(self):
+        """Equal node counts are the common case -- 7 of the 9 real offenders over 400
+        `semla_tmd_samples` graphs are [1, 1, 3] -- so the tie-break decides the outcome.
+        The branch that reaches further survives."""
+        G, u, leaves = _hub_multifurcation(
+            [[0.5, 0.0, 0.0], [0.0, 0.0, 2.0], [0.0, 3.0, 0.0]]
+        )
+        near, mid, far = leaves
+        self.assertEqual(G.degree(u), 4)
+
+        kept = self._positions(sanitise_graph(G))
+        for survivor in (mid, far):
+            self.assertIn(tuple(np.round(G.nodes[survivor]["pos"], 9)), kept)
+        self.assertNotIn(
+            tuple(np.round(G.nodes[near]["pos"], 9)), kept, "the shortest branch goes"
+        )
+
+    def test_exact_ties_fall_back_to_node_id(self):
+        """Three equidistant leaves tie on size AND cable; the result must still be one
+        fixed answer rather than whatever set iteration happened to yield."""
+        G, _u, leaves = _hub_multifurcation(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        )
+        first = sanitise_graph(G)
+        kept = self._positions(first)
+        for survivor in leaves[:2]:
+            self.assertIn(tuple(np.round(G.nodes[survivor]["pos"], 9)), kept)
+        self.assertNotIn(tuple(np.round(G.nodes[leaves[2]]["pos"], 9)), kept)
+
+        for _ in range(3):
+            again = sanitise_graph(G)
+            self.assertEqual(sorted(again.nodes()), sorted(first.nodes()))
+            self.assertEqual(sorted(again.edges()), sorted(first.edges()))
+
+    def test_binarisation_creates_no_non_root_degree_two_node(self):
+        """A node with >2 children keeps exactly 2, so it lands at degree 3, never 2.
+
+        This is why contraction is not run a second time after binarisation.
+        """
+        from semlaflow.validation.sanitise import _binarise, _spanning_stage
+
+        rng = np.random.default_rng(3)
+        for seed in range(20):
+            G = _binary_tree(seed=seed, depth=3, root_children=8)
+            for _ in range(3):
+                victim = int(rng.choice([k for k, d in G.degree() if k != 0 and d == 3]))
+                _extra_child(G, victim, rng.normal(0, 1, 3))
+            T, root, _keep = _spanning_stage(G)
+            B, dropped = _binarise(T, root)
+            self.assertTrue(dropped, f"seed {seed}: fixture should need binarising")
+            self.assertNotIn(2, [d for k, d in B.degree() if k != root], f"seed {seed}")
+
+    def test_no_non_root_multifurcation_survives_sanitisation(self):
+        rng = np.random.default_rng(11)
+        for seed in range(20):
+            G = _binary_tree(seed=seed, depth=3, root_children=8)
+            for _ in range(4):
+                victim = int(rng.choice([k for k in G.nodes() if k != 0]))
+                _extra_child(G, victim, rng.normal(0, 1, 3))
+            S = sanitise_graph(G)
+            non_root = [d for k, d in S.degree() if k != S.graph["root"]]
+            self.assertLessEqual(max(non_root), 3, f"seed {seed}")
+            self.assertNotIn(2, non_root, f"seed {seed}")
+            self.assertTrue(nx.is_tree(S), f"seed {seed}")
+
+
 class HealthTests(unittest.TestCase):
     def test_clean_tree_scores_zero_on_every_key(self):
         graphs = [_binary_tree(seed=s) for s in range(5)]
@@ -214,23 +377,51 @@ class HealthTests(unittest.TestCase):
         `choose_root` prefers the unique maximum-degree node, so it absorbs an offending
         hub most of the time. The second-highest degree consults no root at all; if the
         two agree, root selection is not doing the work.
+
+        The offender has to be a NEW leaf, not a chord between existing nodes: both
+        metrics are now read off the spanning tree, and the MST cuts a chord before either
+        of them sees it. A leaf's single edge is in every spanning tree.
         """
         graphs = []
-        rng = np.random.default_rng(0)
         for s in range(25):
-            G = _binary_tree(seed=s)
-            G.graph.pop("root", None)
-            G = sanitise_graph(G)
+            G = sanitise_graph(_binary_tree(seed=s))
             if s % 3 == 0:
-                nodes = [k for k in G.nodes() if k != G.graph["root"]]
-                a, b = rng.choice(nodes, size=2, replace=False)
-                G.add_edge(int(a), int(b))
+                victim = next(
+                    k for k, d in G.degree() if k != G.graph["root"] and d == 3
+                )
+                nid = max(G.nodes()) + 1
+                G.add_node(nid, pos=G.nodes[victim]["pos"] + np.array([0.1, 0.0, 0.0]))
+                G.add_edge(victim, nid)
             graphs.append(G)
+
+        multifurcation_frac = graph_health(graphs)["multifurcation_frac"]
+        self.assertGreater(
+            multifurcation_frac, 0.0, "the fixture must actually contain multifurcations"
+        )
         self.assertAlmostEqual(
-            graph_health(graphs)["multifurcation_frac"],
+            multifurcation_frac,
             second_highest_degree_multifurcation_frac(graphs),
             places=9,
         )
+
+    def test_multifurcation_is_measured_after_the_mst(self):
+        """A cycle-closing edge inflates degree, but the MST cuts it before binarisation.
+
+        Reporting the raw degree would credit binarisation with a repair the MST already
+        made. Measured over 400 `semla_tmd_samples` graphs the two stages read 0.0700 and
+        0.0225.
+        """
+        G, u, _leaves = _hub_multifurcation([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        # Close a cycle back to a hub leaf. The chord spans the hub's whole radius, so it
+        # is the longest edge on its cycle and is the one the MST cuts.
+        G.add_edge(u, 1)
+
+        raw_non_root = [d for k, d in G.degree() if k != 0]
+        self.assertGreater(max(raw_non_root), 3, "raw graph has a degree-4 node")
+        self.assertEqual(graph_health([G])["multifurcation_frac"], 0.0,
+                         "the MST cuts the chord, so nothing is left to binarise")
+        self.assertEqual(graph_health([G])["cycle_frac"], 1.0,
+                         "the cycle itself is still reported, on the raw graph")
 
     def test_incidence_and_magnitude_differ(self):
         """`non_critical_node_frac` counts graphs; `degree2_node_frac` counts nodes."""

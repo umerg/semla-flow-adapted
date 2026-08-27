@@ -536,16 +536,25 @@ the small ones show hundreds, that is expected and correct.
 `metrics.json` in `--save_dir`, plus `<save_file>_gen3d.png` / `_ref3d.png` grids.
 
 **Read the health block first, then the morphometrics.** Generated graphs are sanitised
-(largest connected component → minimum spanning tree → contract degree-2 nodes) before any
-morphometric is computed, so the morphometrics answer *"given a valid tree, is the
-morphology right?"* and cannot see structural failure. The health keys are the only answer
-to *"is it a valid tree?"* — and every one of them is exactly 0.0 on ground truth for all
-four corpora (1.0 for `lcc_node_frac`), so any non-zero value is a generator failure:
+(largest connected component → minimum spanning tree → binarise → contract degree-2 nodes)
+before any morphometric is computed, so the morphometrics answer *"given a valid tree, is
+the morphology right?"* and cannot see structural failure. The health keys are the only
+answer to *"is it a valid tree?"* — and every one of them is exactly 0.0 on ground truth
+for all four corpora (1.0 for `lcc_node_frac`), so any non-zero value is a generator
+failure:
 
 ```
 disconnected_frac  multifurcation_frac  isolated_node_frac  cycle_frac
 non_critical_node_frac   excess_edge_frac   degree2_node_frac   lcc_node_frac
 ```
+
+The binarise step drops the smallest subtrees at any non-root node with more than two
+children, because both corpora were binarised at preprocessing and the morphometrics would
+otherwise compare a strictly binary reference against a multi-ary sample. It is a verified
+no-op on ground truth. `multifurcation_frac` is the one health key measured *after* the
+MST rather than on the raw graph, so it counts the multifurcations binarisation actually
+has to repair — a cycle-closing edge inflates a node's degree and the MST then cuts it, so
+the raw number is roughly 3× larger and describes a defect that never reaches the metrics.
 
 Measured: at a 1e-5 edge false-positive rate, `cycle_frac` reaches 0.053 while
 `mmd_morpho` is *indistinguishable from clean*. Do not read a good `mmd_morpho` as a

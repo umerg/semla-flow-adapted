@@ -17,7 +17,12 @@ import numpy as np
 
 from semlaflow.models.neuron_cfm import NeuronCFM
 from semlaflow.validation.plot import plot_graph_grid_angles
-from semlaflow.validation.sanitise import sanitise_graph, sanitise_provenance
+from semlaflow.validation.sanitise import (
+    PROVENANCE_EDGE_STATES,
+    PROVENANCE_NODE_STATES,
+    sanitise_graph,
+    sanitise_provenance,
+)
 
 
 def _tree(seed: int = 0, depth: int = 3) -> nx.Graph:
@@ -35,6 +40,25 @@ def _tree(seed: int = 0, depth: int = 3) -> nx.Graph:
                 G.add_edge(parent, idx)
                 new_frontier.append(idx)
         frontier = new_frontier
+    return G
+
+
+def _trifurcating() -> nx.Graph:
+    """Node 1 branches three ways under a degree-5 hub root.
+
+    The hub is what makes this a test: `choose_root` prefers the unique maximum-degree
+    node, so without it the trifurcation would simply become the root and be exempt.
+    Subtree sizes under node 1 are 1, 1, 3, so exactly one leaf is pruned.
+    """
+    G = nx.Graph()
+    pos = {0: (0, 0, 0), 1: (0, 0, 1), 2: (1, 0, 2), 3: (-1, 0, 2), 4: (0, 2, 2),
+           5: (0, 3, 3), 6: (0, 3, 1), 7: (1, 1, 0), 8: (-1, 1, 0), 9: (1, -1, 0),
+           10: (-1, -1, 0)}
+    for i, p in pos.items():
+        G.add_node(i, pos=np.array(p, dtype=float))
+    G.add_edges_from([(0, 1), (1, 2), (1, 3), (1, 4), (4, 5), (4, 6),
+                      (0, 7), (0, 8), (0, 9), (0, 10)])
+    G.graph["root"] = 0
     return G
 
 
@@ -161,18 +185,28 @@ class TestSanitiseProvenance(unittest.TestCase):
         for seed in range(15):
             G = self._perturbed(seed, extra_edges=seed % 5, n_frag=seed % 3)
             prov = sanitise_provenance(G)
-            nodes = prov["kept_nodes"] | prov["contracted_nodes"] | prov["fragment_nodes"]
+            nodes = set().union(*(prov[f"{s}_nodes"] for s in PROVENANCE_NODE_STATES))
             self.assertEqual(nodes, set(G.nodes()))
             self.assertEqual(
-                len(prov["kept_nodes"]) + len(prov["contracted_nodes"])
-                + len(prov["fragment_nodes"]),
+                sum(len(prov[f"{s}_nodes"]) for s in PROVENANCE_NODE_STATES),
                 G.number_of_nodes(), "node states overlap",
             )
             self.assertEqual(
-                len(prov["kept_edges"]) + len(prov["excess_edges"])
-                + len(prov["fragment_edges"]),
+                sum(len(prov[f"{s}_edges"]) for s in PROVENANCE_EDGE_STATES),
                 G.number_of_edges(), "edge states overlap",
             )
+
+    def test_pruned_branch_is_reported(self):
+        """A non-root trifurcation loses its smallest subtree, and the overlay says so."""
+        G = _trifurcating()
+        prov = sanitise_provenance(G)
+        self.assertEqual(len(prov["pruned_nodes"]), 1)
+        pruned = next(iter(prov["pruned_nodes"]))
+        self.assertIn(pruned, {2, 3}, "a size-1 subtree goes, not the size-3 one")
+        self.assertEqual(prov["pruned_edges"], {frozenset((1, pruned))})
+        self.assertNotIn(pruned, prov["kept_nodes"] | prov["contracted_nodes"])
+        # The anti-drift guarantee must survive a state that removes nodes.
+        self.assertEqual(len(prov["kept_nodes"]), sanitise_graph(G).number_of_nodes())
 
     def test_clean_tree_is_all_kept(self):
         G = _tree(seed=0, depth=3)
@@ -300,7 +334,30 @@ class TestOverlayStyleMapping(unittest.TestCase):
         )
         # Only fragment edges are dashed; kept edges are absent from both maps entirely.
         self.assertEqual(set(edge_styles), prov["fragment_edges"])
+        self.assertEqual(prov["pruned_edges"], set(), "fixture has no multifurcation")
         self.assertEqual(len(edge_colors), len(prov["excess_edges"]) + len(prov["fragment_edges"]))
+
+    def test_pruned_nodes_and_edges_are_recoloured_at_full_size(self):
+        """A dropped branch is a defect, not a detail: violet and full-size, never shrunk."""
+        from semlaflow.validation.plot import (
+            NODE_SIZE, PRUNED_EDGE_COLOR, PRUNED_NODE_COLOR, _overlay_styles,
+        )
+
+        G = _trifurcating()
+        prov = sanitise_provenance(G)
+        colors, sizes, edge_colors, edge_styles = _overlay_styles(G, prov, "#8b1e3f")
+
+        order = list(G.nodes())
+        violet = [n for n, c in zip(order, colors) if c == PRUNED_NODE_COLOR]
+        self.assertEqual(set(violet), prov["pruned_nodes"])
+        for n, size in zip(order, sizes):
+            if n in prov["pruned_nodes"]:
+                self.assertEqual(size, NODE_SIZE)
+        self.assertEqual(
+            {k for k, v in edge_colors.items() if v == PRUNED_EDGE_COLOR},
+            prov["pruned_edges"],
+        )
+        self.assertEqual(set(edge_styles), set(), "pruned edges stay solid")
 
 
 class TestOverlayRendering(unittest.TestCase):
@@ -333,6 +390,30 @@ class TestOverlayRendering(unittest.TestCase):
             if np.allclose(mcolors.to_rgba(ln.get_color()), excess_rgba)
         )
         self.assertEqual(n_excess, 1, "the chord should be the one orange edge")
+
+    def test_overlay_renders_pruned_branch(self):
+        import matplotlib.colors as mcolors
+        from semlaflow.validation.plot import PRUNED_EDGE_COLOR, PRUNED_NODE_COLOR
+
+        G = _trifurcating()
+        fig, _ = plot_graph_grid_angles(
+            [G], angles=[(20, 30)], max_graphs=1, sanitise_overlay=True
+        )
+        fig.canvas.draw()
+        ax = fig.axes[0]
+
+        facecolors = ax.collections[-1].get_facecolor()
+        self.assertEqual(len(facecolors), G.number_of_nodes())
+        pruned_rgba = mcolors.to_rgba(PRUNED_NODE_COLOR)
+        n_pruned = sum(1 for c in facecolors if np.allclose(c[:3], pruned_rgba[:3]))
+        self.assertEqual(n_pruned, 1, "the dropped leaf should be violet")
+
+        edge_rgba = mcolors.to_rgba(PRUNED_EDGE_COLOR)
+        n_pruned_edges = sum(
+            1 for ln in ax.get_lines()
+            if np.allclose(mcolors.to_rgba(ln.get_color()), edge_rgba)
+        )
+        self.assertEqual(n_pruned_edges, 1, "its edge to the trifurcation goes too")
 
     def test_fragment_edges_are_dashed(self):
         """Colour alone is not enough -- a solid pale line reads as a real long branch."""

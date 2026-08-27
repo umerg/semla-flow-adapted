@@ -298,8 +298,10 @@ The second least obvious decision, and the one with the most surface area.
 
 **Assumption:** `validation/sanitise.py:sanitise_graph` reduces every graph — generated
 *and* ground-truth — to `largest connected component → relabel → minimum spanning tree →
-contract non-root degree-2 nodes`, and the morphometrics score *that*. Structural health
-is measured on the **raw** graph first, and only then is the graph repaired.
+binarise → contract non-root degree-2 nodes`, and the morphometrics score *that*.
+Structural health is measured on the **raw** graph first, and only then is the graph
+repaired — with one deliberate exception, `multifurcation_frac`, which is measured on the
+spanning tree because that is the input binarisation actually sees (§4.13).
 
 **Why it is necessary.** dendrite_gen's generator emits trees by construction. SemlaFlow's
 bond head emits N² independent edge logits, so it emits cycles, multifurcations, degree-2
@@ -342,14 +344,22 @@ from clean* and only the health keys move:
 | fp 1e-5 | 0.000 | **0.053** | **0.012** | −0.0024 |
 | fn 1% | **0.499** | 0.000 | 0.000 | −0.0019 |
 
+(The `multifurcation` column predates the move to spanning-tree measurement and is a
+raw-graph reading; see §4.13. Injected false-positive edges are exactly the case that shows
+the two stages apart, so expect the 0.012 to read lower now. The conclusion is unchanged —
+it is the health keys that move, not `mmd_morpho`.)
+
 This is why `--ckpt_monitor val-morpho-selection` gates `mmd_morpho` on the health
 fractions. Selecting on `mmd_morpho` alone would let a model emitting garbage with a
-plausible spanning tree win.
+plausible spanning tree win. Note the gate's `--selection_max_multifurcation_frac` ceiling
+now applies to the post-MST number, so an existing threshold is effectively looser than it
+was; retune it if you were relying on the raw reading.
 
 **Why applying it to GT too is safe, and required.** It is a verified no-op there —
-**0/2527** neuron and **0/337** tree val graphs are altered — so it costs nothing, and
-running both sides through the identical path makes a gen/GT asymmetry structurally
-impossible. The same argument as §4.11.
+**0/2527** neuron and **0/337** tree val graphs are altered, and that includes the
+binarise step, which reads **0.0000** on all four corpora both raw and post-MST — so it
+costs nothing, and running both sides through the identical path makes a gen/GT asymmetry
+structurally impossible. The same argument as §4.11.
 
 **Three implementation traps, all of which bit during development:**
 
@@ -418,7 +428,7 @@ stopping in dendrite_gen. `lcc_node_frac` is the unambiguous fragmentation readi
 **`multifurcation_frac` excludes the root.** Including it reads **99.6%** on real neuron
 ground truth, because the soma is a legitimate high-degree hub (per-graph max degree:
 median 8, max 16). Excluding the root it is a perfect discriminator — **0.0000** on GT for
-*both* corpora, **0.0623** on the real generations. The pooled non-root degree distribution
+*all four* corpora, non-zero on real generations. The pooled non-root degree distribution
 on real neurons is exactly `{1: 0.5655, 3: 0.4345}`, with zero mass at degree 0, 2, 4, 5
 and 6.
 
@@ -428,6 +438,23 @@ consults no root at all, flags the identical set of graphs. That equivalence is 
 `tests/validation_metrics.py:test_multifurcation_matches_root_free_cross_check`. The
 root-excluding form is the one shipped because the second-highest form would miss a lone
 degree-4 node on the tree corpora, where the root has degree 1.
+
+**And it is measured on the spanning tree, not the raw graph** — the only health key that
+is. That corpus-specific degree distribution is not an accident of the data: dendrite_gen's
+`clean_trees.normalize_high_degree` binarised the corpora at preprocessing, so ground truth
+*structurally cannot* contain a non-root multifurcation. `sanitise_graph` therefore
+binarises too (dropping the smallest subtrees at any non-root node with more than two
+children, ranked by subtree node count then branch cable length, since the generated graph
+has no radius to rank by), or `partition_asymmetry` — which averages over all child pairs —
+would be comparing a strictly binary reference against a multi-ary sample.
+
+Given that, the useful reading is "how much does binarisation have to repair", and the raw
+graph overstates it by roughly 3×: a cycle-closing edge inflates a node's degree and the
+MST cuts it again before binarisation ever runs. Over 400 graphs of `semla_tmd_samples` the
+raw rate is **0.0700** and the post-MST rate is **0.0225**; the shipped key is the latter.
+The repair itself is tiny — 9 nodes of 16724 (0.05%), all of them at degree-4 nodes, none
+at degree ≥ 5 — and moves every morphometric by under 1% except `degree_w1`, which improves
+by 3.2%, which is the point of doing it.
 
 ### 4.14 `mmd_morpho` is not numerically comparable to dendrite_gen's
 

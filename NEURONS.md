@@ -214,7 +214,7 @@ property. Values shown are from a real run (`vivid-thunder-13`):
 | Key | Meaning | real run |
 | --- | --- | ---: |
 | `disconnected_frac` | fraction of graphs that are not connected | 0.125 |
-| `multifurcation_frac` | fraction with a **non-root** node of degree > 3 | 0.062 |
+| `multifurcation_frac` | fraction whose *spanning tree* has a **non-root** node of degree > 3 | 0.062 |
 | `isolated_node_frac` | fraction containing a degree-0 node | 0.049 |
 | `cycle_frac` | fraction with at least one cycle | 0.038 |
 | `non_critical_node_frac` | fraction with a non-root degree-2 node | 0.135 |
@@ -223,6 +223,14 @@ property. Values shown are from a real run (`vivid-thunder-13`):
 
 `multifurcation_frac` **excludes the root** — including it reads 99.6% on real neuron GT,
 because the soma is a legitimate high-degree hub.
+
+It is also the one key **not** measured on the raw graph. Sanitisation now binarises
+(drops the smallest subtrees at any non-root node with more than two children, matching
+what `clean_trees.normalize_high_degree` did to the corpora), and this key is read off the
+spanning tree immediately before that step, so it counts the multifurcations binarisation
+actually repairs rather than ones the MST already cut. The 0.062 above predates the change
+and is a raw-graph reading; over 400 graphs of `semla_tmd_samples` the raw rate is 0.070
+and the post-MST rate is 0.023, so expect roughly a 3× drop on an unchanged model.
 
 *Morphometrics* (lower is better for `*_w1` and `mmd_*`; higher for `density_*` /
 `coverage_*`):

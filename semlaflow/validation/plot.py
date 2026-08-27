@@ -33,7 +33,7 @@ SKELETON_WIDTH = 1.8
 # Sanitisation-overlay palette. Colour carries membership of the critical tree the
 # morphometrics scored, size carries level of detail: same colour = same tree, smaller =
 # detail contraction collapsed, grey = the metrics never saw it, orange = an edge the MST
-# cut. Only genuine defects are visually loud.
+# cut, violet = a branch binarisation dropped. Only genuine defects are visually loud.
 FRAGMENT_NODE_COLOR = "#9e9e9e"   # outside the largest connected component
 # Dashed, not just paler: the default kept-edge `lightgray` is #d3d3d3, so any "slightly
 # lighter grey" is indistinguishable at figure scale and a detached edge would read as a
@@ -41,6 +41,12 @@ FRAGMENT_NODE_COLOR = "#9e9e9e"   # outside the largest connected component
 FRAGMENT_EDGE_COLOR = "#9e9e9e"
 FRAGMENT_EDGE_STYLE = (0, (4, 3))
 EXCESS_EDGE_COLOR = "#e07b39"     # inside the LCC, cut by the MST (cycle-closing)
+# Dropped by `_binarise` at a multifurcation. Solid and full-size, not shrunk like a
+# contraction: the generator emitting a trifurcation is a real defect, not a detail the
+# critical tree folds away. Violet reads as distinct from both the fragment grey and the
+# excess orange at figure scale.
+PRUNED_NODE_COLOR = "#7b52ab"
+PRUNED_EDGE_COLOR = "#7b52ab"
 CONTRACTED_SIZE_FRAC = 0.45       # non-root degree-2 nodes, collapsed to a critical tree
 
 
@@ -82,6 +88,9 @@ def _overlay_styles(G: nx.Graph, provenance: dict, node_color: str):
         if n in provenance["fragment_nodes"]:
             colors.append(FRAGMENT_NODE_COLOR)
             sizes.append(NODE_SIZE)
+        elif n in provenance["pruned_nodes"]:
+            colors.append(PRUNED_NODE_COLOR)
+            sizes.append(NODE_SIZE)
         elif n in provenance["contracted_nodes"]:
             colors.append(node_color)
             sizes.append(NODE_SIZE * CONTRACTED_SIZE_FRAC)
@@ -92,6 +101,8 @@ def _overlay_styles(G: nx.Graph, provenance: dict, node_color: str):
     edge_colors, edge_styles = {}, {}
     for key in provenance["excess_edges"]:
         edge_colors[key] = EXCESS_EDGE_COLOR
+    for key in provenance["pruned_edges"]:
+        edge_colors[key] = PRUNED_EDGE_COLOR
     for key in provenance["fragment_edges"]:
         edge_colors[key] = FRAGMENT_EDGE_COLOR
         edge_styles[key] = FRAGMENT_EDGE_STYLE
@@ -214,12 +225,13 @@ def _add_overlay_legend(fig, keep_color: str) -> None:
     handles = [
         marker(keep_color, 6, "kept (critical tree)"),
         marker(keep_color, 6 * (CONTRACTED_SIZE_FRAC ** 0.5), "contracted (deg-2)"),
+        marker(PRUNED_NODE_COLOR, 6, "pruned (multifurcation)"),
         marker(FRAGMENT_NODE_COLOR, 6, "fragment (outside LCC)"),
         Line2D([], [], color=EXCESS_EDGE_COLOR, linewidth=2.0, label="excess edge (MST-cut)"),
         Line2D([], [], color=FRAGMENT_EDGE_COLOR, linewidth=1.4,
                linestyle=FRAGMENT_EDGE_STYLE, label="fragment edge"),
     ]
-    fig.legend(handles=handles, loc="lower center", ncol=5, frameon=False, fontsize=8)
+    fig.legend(handles=handles, loc="lower center", ncol=6, frameon=False, fontsize=8)
 
 
 def plot_graph_grid_angles(
@@ -251,9 +263,10 @@ def plot_graph_grid_angles(
 
     ``sanitise_overlay`` colours each graph by what `sanitise_graph` would do to it, so the
     critical tree the morphometrics actually scored is visible inside the raw emission:
-    fragments outside the largest component go grey, edges the MST cuts go orange, and
-    degree-2 nodes that contraction collapses shrink. Off by default, so the plain
-    single-colour drawing is unchanged for any caller that does not ask for it.
+    fragments outside the largest component go grey, edges the MST cuts go orange,
+    branches binarisation drops go violet, and degree-2 nodes that contraction collapses
+    shrink. Off by default, so the plain single-colour drawing is unchanged for any caller
+    that does not ask for it.
 
     With ``out_dir`` set, saves to ``out_dir/<stem>_<file_tag>.png``; with ``out_dir=None``
     nothing is written and ``out_path`` comes back as ``None`` (the in-training logging path
