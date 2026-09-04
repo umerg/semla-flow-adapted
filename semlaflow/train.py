@@ -636,7 +636,7 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tmd_conditioning", action="store_true",
                         help="Condition generation on a per-graph TMD vector (requires data "
                              "preprocessed with --compute_tmd). Off => unconditional, unchanged.")
-    parser.add_argument("--tmd_hidden", type=int, default=64,
+    parser.add_argument("--tmd_hidden", type=int, default=128,
                         help="Hidden/projection dim for the TMD conditioning MLP (when enabled).")
     parser.add_argument("--type_conditioning", action="store_true",
                         help="Condition generation on a per-graph neuron cell-class label (requires a "

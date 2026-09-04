@@ -154,7 +154,7 @@ Selected flags (see the bottom of `train.py` for the full list):
 | `--no_val_structural_metrics` | (on) | disable the per-validation generation rollout (faster; loses the trajectory) |
 | `--no_ema` | (EMA on) | |
 | `--trial_run` | off | 1 epoch, no logger — smoke test |
-| `--tmd_conditioning` / `--tmd_hidden` | off / 64 | see [§4](#4-tmd-conditioning) |
+| `--tmd_conditioning` / `--tmd_hidden` | off / 128 | see [§4](#4-tmd-conditioning) |
 | `--type_conditioning` / `--class_hidden` | off / 16 | cell-class conditioning, see [§5](#5-neuron-type-cell-class-conditioning) |
 | `--no_per_cell_class` | (on) | disable per-class stratified val metrics |
 | `--per_cell_class_min_count` | 20 | min val graphs per class for stratified metrics |
@@ -415,12 +415,16 @@ python -m semlaflow.train \
     --dataset neurons \
     --data_path /path/to/neurons_final/smol \
     --tmd_conditioning \
-    --tmd_hidden 64
+    --tmd_hidden 128
 ```
 
 - `tmd_dim` is inferred from the training data; training raises a clear error if
   the `.smol` has no TMD vectors (re-run preprocessing with `--compute_tmd`), or
   if its width disagrees with its recorded filtrations.
+- `--tmd_hidden` defaults to **128**, matching the dendrite_gen arm this is compared
+  against (`config/parity_neurons_tmd.yaml`). That equalises the descriptor bottleneck,
+  not the capacity cost — there the width is carved out of a fixed `feats_dim: 256`,
+  here it is added on top of `d_model`. See RUN.md §1a for the full argument.
 - `tmd_dim` / `tmd_hidden` / `tmd_filtrations` are saved into the checkpoint
   hparams, so the conditioning MLP is reconstructed automatically on load and the
   descriptor can be verified at sampling time.

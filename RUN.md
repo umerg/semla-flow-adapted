@@ -169,7 +169,7 @@ python -m semlaflow.train \
     --dataset neurons_conditional_full \
     --data_path /Users/umer/Documents/neurons_conditional_full/smol \
     --max_atoms 538 \
-    --tmd_conditioning --tmd_hidden 64
+    --tmd_conditioning --tmd_hidden 128
 
 # sample + evaluate (paired: each sample gets a real graph's descriptor)
 python -m semlaflow.sample_neurons \
@@ -197,13 +197,26 @@ graphs. `compute_neuron_tmd` is pure numpy/networkx; `persim` is only needed for
 metrics below, not for building the descriptor.
 
 Notes:
-- Expect `TMD conditioning enabled: tmd_dim=512 (path, radial_root), tmd_hidden=64`.
+- Expect `TMD conditioning enabled: tmd_dim=512 (path, radial_root), tmd_hidden=128`.
   A `tmd_dim=256` here means the `.smol` was built with one filtration — re-preprocess.
 - `--tmd_filtrations` takes only `path` and `radial_root`. `height`/`rho` are rejected:
   they need a fixed anatomical axis that the random-rotation transform destroys
   (COMPATIBLE.md §4.15).
 - Sampling **fails** if the checkpoint's filtrations differ from the dataset's. Both
   sets are 512-dim, so this guard is the only thing that catches a mismatched `.smol`.
+- **`--tmd_hidden 128` is chosen for parity with the dendrite_gen arm we compare against**
+  (`config/parity_neurons_tmd.yaml:107`, `tmd_hidden_dim: 128`; every `parity_*_tmd` config
+  uses 128 — the 64s live in the `depth_trees_*_tmd` ablation suite, which is not a
+  head-to-head arm). What that equalises is the *descriptor bottleneck*: both sides squeeze
+  the same 512-d persistence image down to 128 before broadcasting it to every node. It does
+  **not** equalise the capacity trade-off, because the knob is wired differently: dendrite_gen
+  reserves the width out of a fixed `feats_dim: 256` (`egnn_so2.py:660` enforces
+  `tmd_hidden_dim + class_hidden_dim <= feats_dim`), so conditioning costs it half the node
+  feature width, while here it is additive on top of `d_model` (`semla.py:804`,
+  `in_feats = in_feats + tmd_hidden`) and costs the node features nothing. The budget-parity
+  protocol itself (`dendrite_gen/docs/BUDGET_PARITY_SEMLAFLOW.md` §5.2) matches epochs and
+  only *reports* steps — it says nothing about widths, and the two backbones are unmatched
+  anyway (256x12 vs 384x12), so this is a deliberate choice, not a constraint.
 - Watch `val-tmd_cond-pd_wasserstein_path_mean` for whether the conditioning is being
   followed. On a conditioned run `mmd_tmd` cannot tell you that — its filtration is one
   the model trained on (COMPATIBLE.md §4.14).
