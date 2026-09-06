@@ -484,8 +484,15 @@ def build_trainer(args):
     # callback during training (loggers/wandb.py: `log_model == "all" or log_model is True and
     # checkpoint_callback.save_top_k == -1`). At the defaults that is 30 weights-only snapshots
     # of ~175 MB plus the two full end-of-run checkpoints, i.e. ~6 GB uploaded per run.
+    #
+    # `id`/`resume` continue an existing W&B run when training is resumed, so the metrics land
+    # on one continuous set of charts instead of splitting across two runs. resume="must" fails
+    # loudly on a wrong id rather than quietly starting a fresh run. Reusing the id also puts
+    # the ModelCheckpoint callbacks back in the original run's checkpoints/ directory, since
+    # Lightning resolves that from the logger's save_dir/name/version.
     logger = None if args.trial_run else WandbLogger(
-        project=project_name, save_dir="wandb", log_model=args.wandb_log_model
+        project=project_name, save_dir="wandb", log_model=args.wandb_log_model,
+        id=args.wandb_run_id, resume="must" if args.wandb_run_id is not None else None,
     )
 
     # Make `epoch` the default x-axis for every panel.
@@ -583,6 +590,16 @@ def build_trainer(args):
 
 
 def main(args):
+    # Check the resume args before loading a datamodule and building a model, so a typo'd
+    # path costs seconds rather than minutes.
+    if args.ckpt_path is not None and not Path(args.ckpt_path).is_file():
+        raise FileNotFoundError(f"--ckpt_path does not exist: {args.ckpt_path}")
+    if args.wandb_run_id is not None and args.ckpt_path is None:
+        raise ValueError(
+            "--wandb_run_id without --ckpt_path would append a fresh from-scratch run to an "
+            "existing W&B run's history. Pass both, or neither."
+        )
+
     # Set some useful torch properties
     # Float32 precision should only affect computation on A100 and should in theory be a lot faster than the default
     # Increasing the cache size is required since the model will be compiled seperately for each bucket
@@ -608,8 +625,11 @@ def main(args):
 
     trainer = build_trainer(args)
 
+    if args.ckpt_path is not None:
+        print(f"Resuming training state from {args.ckpt_path}")
+
     print("Fitting datamodule to model...")
-    trainer.fit(model, datamodule=dm)
+    trainer.fit(model, datamodule=dm, ckpt_path=args.ckpt_path)
     print("Training complete.")
 
 
@@ -730,6 +750,21 @@ def get_parser() -> argparse.ArgumentParser:
              "and the upload is ~6 GB per run at the defaults (every 'snap-' snapshot goes up "
              "during training, because that callback uses save_top_k=-1). Turn it on only if "
              "you need to pull checkpoints from the W&B UI rather than the training filesystem."
+    )
+    parser.add_argument(
+        "--ckpt_path", type=str, default=None,
+        help="Resume training from a full checkpoint, e.g. "
+             "wandb/<project>/<run-id>/checkpoints/last.ckpt. It must be a full checkpoint: "
+             "the 'snap-' files are save_weights_only=True and carry no optimizer, scheduler "
+             "or epoch state. The model args must match the run that wrote it, since the model "
+             "is rebuilt from argv before the state dict is loaded. 'last.ckpt' is only "
+             "rewritten every --val_check_epochs, so a resume rewinds to the last validation."
+    )
+    parser.add_argument(
+        "--wandb_run_id", type=str, default=None,
+        help="Resume logging into this existing W&B run (the <run-id> in the checkpoint path) "
+             "rather than starting a new one, keeping one continuous set of charts across the "
+             "restart. Requires --ckpt_path."
     )
     for _key, _flag in SELECTION_HEALTH_FLAGS.items():
         parser.add_argument(
