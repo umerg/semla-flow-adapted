@@ -38,7 +38,7 @@ from semlaflow.util.molrepr import GeometricMol, GeometricMolBatch
 
 DEFAULT_SAVE_FILE = "neuron_samples.smol"
 DEFAULT_DATASET_SPLIT = "val"
-DEFAULT_N_MOLECULES = 256
+DEFAULT_N_MOLECULES = -1
 DEFAULT_BATCH_COST = 8192
 DEFAULT_BUCKET_COST_SCALE = "linear"
 DEFAULT_INTEGRATION_STEPS = 100
@@ -157,7 +157,16 @@ def build_dm(args, hparams, vocab):
     )
 
     dataset = GeometricDataset.load(_split_path(args.data_path, args.dataset_split), transform=transform)
-    dataset = dataset.sample(args.n_molecules, replacement=True)
+    if args.n_molecules >= 0:
+        # Draws WITH replacement, so this neither enumerates the split nor yields distinct
+        # graphs -- at n_molecules == len(split) the expected distinct coverage is only
+        # 1 - (1 - 1/N)^N ~= 63%. Kept for sampling a fixed budget off a large split; -1
+        # (the default) uses the split as loaded, every graph exactly once.
+        dataset = dataset.sample(args.n_molecules, replacement=True)
+    print(
+        f"Sampling {len(dataset)} graphs from the {args.dataset_split} split"
+        f"{' (full split)' if args.n_molecules < 0 else ' (resampled with replacement)'}."
+    )
 
     type_mask_index = (
         vocab.indices_from_tokens(["<MASK>"])[0]
@@ -385,7 +394,8 @@ def evaluate_samples(args, gen_mols: list[GeometricMol], save_dir: Path,
 
 
 def main(args):
-    print(f"Sampling {args.n_molecules} neuron graphs...")
+    requested = "every" if args.n_molecules < 0 else str(args.n_molecules)
+    print(f"Sampling {requested} neuron graph(s) from the {args.dataset_split} split...")
     print(f"Checkpoint: {args.ckpt_path}")
 
     L.seed_everything(args.seed)
@@ -487,9 +497,10 @@ def main(args):
     all_mols: list[GeometricMol] = []
     gen_classes: list[int] = []  # conditioning class per emitted sample (type-conditioned runs)
     # The specific GT graph each sample was conditioned on (TMD-conditioned runs). It cannot
-    # be recovered after the loop: `build_dm` resamples the split with replacement, so
-    # gt_mols[i] is NOT the pair of all_mols[i]. batch[1] is the `data` dict built from the
-    # same mols as the prior, so it is the only correct source for the pairing.
+    # be recovered after the loop: the bucketed loader emits graphs grouped by size rather
+    # than in split order, and --n_molecules >= 0 additionally resamples the split with
+    # replacement, so gt_mols[i] is NOT the pair of all_mols[i]. batch[1] is the `data` dict
+    # built from the same mols as the prior, so it is the only correct source for the pairing.
     paired_gt_mols: list[GeometricMol] = []
     raw_batches: list[dict] = []
     sampling_seconds_total = 0.0  # wall-clock spent inside _generate (the ODE rollout only)
@@ -575,7 +586,15 @@ if __name__ == "__main__":
                              "coord scale, bucket limits and class names from "
                              "scriptutil.DATASET_CONFIGS. Normally inferred from the checkpoint.")
     parser.add_argument("--dataset_split", type=str, default=DEFAULT_DATASET_SPLIT)
-    parser.add_argument("--n_molecules", type=int, default=DEFAULT_N_MOLECULES)
+    parser.add_argument(
+        "--n_molecules", type=int, default=DEFAULT_N_MOLECULES,
+        help="How many graphs to sample. -1 (default) uses every graph in --dataset_split "
+             "exactly once, in split order -- what you want to evaluate against a whole "
+             "split, and what --tmd_cond needs to condition on each real graph once. A value "
+             ">= 0 instead draws that many graphs WITH replacement, so it neither enumerates "
+             "the split nor yields distinct graphs (~63%% expected distinct coverage when it "
+             "equals the split size), while the metrics still score against the full split."
+    )
     parser.add_argument("--batch_cost", type=int, default=DEFAULT_BATCH_COST)
     parser.add_argument("--integration_steps", type=int, default=DEFAULT_INTEGRATION_STEPS)
     parser.add_argument("--cat_sampling_noise_level", type=int, default=DEFAULT_CAT_SAMPLING_NOISE_LEVEL)

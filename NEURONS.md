@@ -183,7 +183,8 @@ python -m semlaflow.sample_neurons \
 
 What it does:
 1. Loads the `NeuronCFM` checkpoint.
-2. Samples `--n_molecules` (default 256) graphs from a **pure-noise prior**; the
+2. Samples `--n_molecules` graphs from a **pure-noise prior** (default `-1`, i.e. every
+   graph in the split exactly once; a value >= 0 resamples with replacement); the
    node-count distribution is drawn from `--dataset_split` (default `val`). The
    real graphs are only consulted for their sizes.
 3. Writes the raw predicted graphs (coords + binary-edge adjacency, no tree
@@ -298,7 +299,7 @@ Selected flags:
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `--dataset_split` | `val` | `train` / `val` / `test` — size-prior + GT source |
-| `--n_molecules` | 256 | number of samples |
+| `--n_molecules` | -1 | number of samples; -1 = the whole split, once each |
 | `--integration_steps` | 100 | ODE steps |
 | `--ode_sampling_strategy` | `log` | `linear` or `log` time grid |
 | `--n_plot_examples` | 8 | samples per plot grid |
